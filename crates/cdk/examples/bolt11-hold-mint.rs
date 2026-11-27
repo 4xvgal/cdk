@@ -176,6 +176,17 @@ fn verify_invoice(request: &str, payment_hash: &str, amount: Amount, cltv: u32) 
     Ok(())
 }
 
+fn quote_extra(payment_hash: &str, cltv: u32, lockup_script: Option<&str>) -> Value {
+    let mut extra = json!({
+        "payment_hash": payment_hash,
+        "min_final_cltv_expiry_delta": cltv,
+    });
+    if let Some(script) = lockup_script {
+        extra["lockup"] = json!({ "script": script.to_lowercase() });
+    }
+    extra
+}
+
 async fn quote(args: &[String]) -> CliResult<()> {
     let mint_url = argument(args, 1, "mint_url")?;
     let payment_hash = argument(args, 2, "payment_hash")?.to_lowercase();
@@ -184,13 +195,11 @@ async fn quote(args: &[String]) -> CliResult<()> {
         Some(cltv) => cltv.parse::<u32>()?,
         None => DEFAULT_CLTV,
     };
+    let lockup_script = option(args, "--lockup-script");
 
     let store = localstore(&wallet_dir()).await?;
     let wallet = open_wallet(&mint_url, store).await?;
-    let extra = json!({
-        "payment_hash": &payment_hash,
-        "min_final_cltv_expiry_delta": cltv,
-    });
+    let extra = quote_extra(&payment_hash, cltv, lockup_script.as_deref());
     let quote = wallet
         .mint_quote(
             PaymentMethod::Custom(METHOD.to_string()),
@@ -265,8 +274,9 @@ async fn dispatch(args: &[String]) -> CliResult<()> {
         Some("settle") => settle(args).await,
         Some("mint") => mint(args).await,
         _ => Err(
-            "usage: quote <mint_url> <payment_hash> <amount> [--cltv 432] | status <quote> | \
-                  settle <quote> <preimage> | mint <quote> | pubkey <secret_key_hex>"
+            "usage: quote <mint_url> <payment_hash> <amount> [--cltv 432] \
+                  [--lockup-script <hex>] | status <quote> | settle <quote> <preimage> | \
+                  mint <quote> | pubkey <secret_key_hex>"
                 .into(),
         ),
     }
@@ -338,6 +348,20 @@ mod tests {
     fn rejects_other_cltv() {
         let request = invoice(AMOUNT_SAT * 1000, 144, requested_hash());
         assert!(verify_invoice(&request, PAYMENT_HASH, Amount::from(AMOUNT_SAT), CLTV).is_err());
+    }
+
+    #[test]
+    fn extra_carries_the_lockup_script_when_given() {
+        let extra = quote_extra(PAYMENT_HASH, CLTV, Some("8201AB"));
+        assert_eq!(extra["lockup"]["script"], json!("8201ab"));
+        assert_eq!(extra["payment_hash"], json!(PAYMENT_HASH));
+        assert_eq!(extra["min_final_cltv_expiry_delta"], json!(CLTV));
+    }
+
+    #[test]
+    fn extra_has_no_lockup_without_a_script() {
+        let extra = quote_extra(PAYMENT_HASH, CLTV, None);
+        assert!(extra.get("lockup").is_none());
     }
 
     #[test]
