@@ -177,6 +177,10 @@ required-features = ["wallet"]
 name = "revoke_send"
 required-features = ["wallet"]
 
+[[example]]
+name = "bolt11-hold-mint"
+required-features = ["wallet"]
+
 [dev-dependencies]
 rand.workspace = true
 cdk-sqlite.workspace = true
