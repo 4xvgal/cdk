@@ -2,10 +2,29 @@ syntax = "proto3";
 
 package invoicesrpc;
 
+import "lnrpc.proto";
+
 option go_package = "github.com/lightningnetwork/lnd/lnrpc/invoicesrpc";
 
 service Invoices {
+    rpc SubscribeSingleInvoice(SubscribeSingleInvoiceRequest) returns (stream lnrpc.Invoice);
+
+    rpc CancelInvoice(CancelInvoiceMsg) returns (CancelInvoiceResp);
+
     rpc AddHoldInvoice(AddHoldInvoiceRequest) returns (AddHoldInvoiceResp);
+}
+
+message SubscribeSingleInvoiceRequest {
+    reserved 1;
+
+    bytes r_hash = 2;
+}
+
+message CancelInvoiceMsg {
+    bytes payment_hash = 1;
+}
+
+message CancelInvoiceResp {
 }
 
 message AddHoldInvoiceRequest {

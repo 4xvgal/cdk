@@ -102,6 +102,7 @@ pub const ENV_LND_HOLD_MAX_FINAL_CLTV_EXPIRY_DELTA: &str =
     "CDK_PAYMENT_PROCESSOR_LND_HOLD_MAX_FINAL_CLTV_EXPIRY_DELTA";
 pub const ENV_LND_HOLD_SETTLE_MARGIN_BLOCKS: &str =
     "CDK_PAYMENT_PROCESSOR_LND_HOLD_SETTLE_MARGIN_BLOCKS";
+pub const ENV_LND_HOLD_EXPIRY_DELTA: &str = "CDK_PAYMENT_PROCESSOR_LND_HOLD_EXPIRY_DELTA";
 pub const ENV_LND_HOLD_MAX_PENDING_QUOTES: &str =
     "CDK_PAYMENT_PROCESSOR_LND_HOLD_MAX_PENDING_QUOTES";
 pub const ENV_LND_HOLD_INVOICE_EXPIRY_SECS: &str =
@@ -335,6 +336,8 @@ pub fn lnd_hold_settings_from_env() -> anyhow::Result<cdk_lnd_hold::Settings> {
         .unwrap_or(settings.max_final_cltv_expiry_delta);
     settings.settle_margin_blocks =
         env_parsed(ENV_LND_HOLD_SETTLE_MARGIN_BLOCKS)?.unwrap_or(settings.settle_margin_blocks);
+    settings.lnd_hold_expiry_delta =
+        env_parsed(ENV_LND_HOLD_EXPIRY_DELTA)?.unwrap_or(settings.lnd_hold_expiry_delta);
     settings.max_pending_quotes =
         env_parsed(ENV_LND_HOLD_MAX_PENDING_QUOTES)?.unwrap_or(settings.max_pending_quotes);
     settings.invoice_expiry_secs =

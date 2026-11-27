@@ -1,9 +1,12 @@
 #![doc = include_str!("../README.md")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cdk_common::bitcoin::hashes::Hash;
@@ -15,11 +18,26 @@ use cdk_common::payment::{
 use cdk_common::util::hex;
 use cdk_common::{Amount, Bolt11Invoice, CurrencyUnit};
 use cdk_lnd::{client, invoicesrpc, lnrpc};
-use futures::Stream;
+use futures::{Stream, StreamExt};
+use hold::{follow_action, FollowAction, HoldState, HoldStatus, HoldTracker};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request};
 use tracing::instrument;
+
+/// Hold state of `bolt11_hold` invoices
+///
+/// LND invoices are mapped to records, the settle deadline is derived from them,
+/// and the cancel decision is a comparison with the current block height. This
+/// module has no I/O.
+pub mod hold;
+
+const EVENT_CHANNEL_CAPACITY: usize = 64;
+const RECOVERY_PAGE_SIZE: u64 = 1_000;
+const BLOCK_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const SUBSCRIPTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Custom payment method served by this backend
 pub const METHOD: &str = "bolt11_hold";
@@ -40,6 +58,9 @@ pub struct Settings {
     /// Blocks subtracted from the lowest accepted HTLC expiry to get the settle
     /// deadline
     pub settle_margin_blocks: u32,
+    /// Blocks before that same expiry at which LND cancels the hold invoice by
+    /// itself (`invoices.holdexpirydelta`)
+    pub lnd_hold_expiry_delta: u32,
     /// Maximum number of unpaid and held quotes
     pub max_pending_quotes: u32,
     /// Hold invoice expiry in seconds
@@ -54,7 +75,8 @@ impl Default for Settings {
             macaroon_file: PathBuf::new(),
             min_final_cltv_expiry_delta: 144,
             max_final_cltv_expiry_delta: 576,
-            settle_margin_blocks: 12,
+            settle_margin_blocks: 22,
+            lnd_hold_expiry_delta: 18,
             max_pending_quotes: 100,
             invoice_expiry_secs: 3600,
         }
@@ -70,77 +92,6 @@ impl Settings {
             "settle_margin_blocks": self.settle_margin_blocks,
             "max_pending_quotes": self.max_pending_quotes,
         })
-    }
-}
-
-/// NUT-XX hold state of a quote
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HoldState {
-    /// No HTLCs, or HTLCs not summing to the amount, have been accepted
-    Unpaid,
-    /// HTLCs summing to the amount are accepted and not resolved
-    Held,
-    /// The HTLCs were settled with the preimage
-    Settled,
-    /// The held HTLCs were cancelled
-    Cancelled,
-}
-
-impl HoldState {
-    /// NUT-XX string form
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Unpaid => "UNPAID",
-            Self::Held => "HELD",
-            Self::Settled => "SETTLED",
-            Self::Cancelled => "CANCELLED",
-        }
-    }
-
-    fn from_invoice_state(state: lnrpc::invoice::InvoiceState) -> Self {
-        match state {
-            lnrpc::invoice::InvoiceState::Open => Self::Unpaid,
-            lnrpc::invoice::InvoiceState::Accepted => Self::Held,
-            lnrpc::invoice::InvoiceState::Settled => Self::Settled,
-            lnrpc::invoice::InvoiceState::Canceled => Self::Cancelled,
-        }
-    }
-}
-
-/// Hold state and timing of an LND hold invoice
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HoldStatus {
-    /// NUT-XX hold state
-    pub state: HoldState,
-    /// Lowest `expiry_height` over accepted HTLCs
-    pub min_htlc_expiry_height: Option<i32>,
-}
-
-impl HoldStatus {
-    /// Map an LND invoice to a hold status
-    pub fn from_invoice(invoice: &lnrpc::Invoice) -> Self {
-        Self {
-            state: HoldState::from_invoice_state(invoice.state()),
-            min_htlc_expiry_height: invoice
-                .htlcs
-                .iter()
-                .filter(|htlc| htlc.state() == lnrpc::InvoiceHtlcState::Accepted)
-                .map(|htlc| htlc.expiry_height)
-                .min(),
-        }
-    }
-
-    /// Extra JSON fields describing the hold
-    pub fn extra_json(self) -> Value {
-        json!({
-            "hold_state": self.state.as_str(),
-            "min_htlc_expiry_height": self.min_htlc_expiry_height,
-        })
-    }
-
-    /// `true` once LND has settled the invoice
-    pub fn is_settled(self) -> bool {
-        self.state == HoldState::Settled
     }
 }
 
@@ -160,6 +111,17 @@ struct ExtraFields {
 
 fn invalid(message: &str) -> payment::Error {
     payment::Error::Custom(message.to_string())
+}
+
+fn validate_settings(settings: &Settings) -> Result<(), payment::Error> {
+    if settings.settle_margin_blocks <= settings.lnd_hold_expiry_delta {
+        return Err(invalid(&format!(
+            "settle_margin_blocks ({}) must exceed lnd_hold_expiry_delta ({})",
+            settings.settle_margin_blocks, settings.lnd_hold_expiry_delta,
+        )));
+    }
+
+    Ok(())
 }
 
 fn validate_request(
@@ -234,8 +196,10 @@ fn add_hold_invoice_request(
 
 /// LND hold invoice backend serving the `bolt11_hold` custom payment method
 pub struct LndHold {
-    client: client::Client,
     settings: Settings,
+    watcher: Watcher,
+    event_stream_active: Arc<AtomicBool>,
+    event_cancel: CancellationToken,
 }
 
 impl std::fmt::Debug for LndHold {
@@ -250,6 +214,8 @@ impl LndHold {
     /// Connect to LND
     #[instrument(skip_all)]
     pub async fn new(settings: Settings) -> Result<Self, payment::Error> {
+        validate_settings(&settings)?;
+
         let client = client::connect(
             &settings.address,
             &settings.cert_file,
@@ -258,9 +224,36 @@ impl LndHold {
         .await
         .map_err(|err| invalid(&format!("LND connection error: {err}")))?;
 
-        Ok(Self { client, settings })
-    }
+        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
+        let watcher = Watcher {
+            client,
+            tracker: Arc::new(HoldTracker::new(settings.settle_margin_blocks)),
+            events,
+            watched: Arc::new(Mutex::new(HashSet::new())),
+        };
+
+        tokio::spawn(poll_block_height(watcher.clone()));
+        tokio::spawn(recover_pending_invoices(watcher.clone()));
+
+        Ok(Self {
+            settings,
+            watcher,
+            event_stream_active: Arc::new(AtomicBool::new(false)),
+            event_cancel: CancellationToken::new(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct Watcher {
+    client: client::Client,
+    tracker: Arc<HoldTracker>,
+    events: broadcast::Sender<WaitPaymentResponse>,
+    watched: Arc<Mutex<HashSet<[u8; 32]>>>,
+}
+
+impl Watcher {
     async fn lookup_invoice(
         &self,
         payment_hash: &[u8; 32],
@@ -279,6 +272,234 @@ impl LndHold {
             Ok(invoice) => Ok(Some(invoice.into_inner())),
             Err(status) if status.code() == Code::NotFound => Ok(None),
             Err(status) => Err(invalid(&format!("LND LookupInvoice failed: {status}"))),
+        }
+    }
+
+    fn ensure_watching(&self, payment_hash: &[u8; 32]) {
+        let inserted = self
+            .watched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(*payment_hash);
+
+        if !inserted {
+            return;
+        }
+
+        tokio::spawn(follow_hold_invoice(
+            self.client.clone(),
+            Arc::clone(&self.tracker),
+            self.events.clone(),
+            *payment_hash,
+        ));
+    }
+}
+
+async fn recover_pending_invoices(watcher: Watcher) {
+    let mut client = watcher.client.clone();
+    let mut index_offset = 0;
+
+    loop {
+        let request = lnrpc::ListInvoiceRequest {
+            pending_only: true,
+            index_offset,
+            num_max_invoices: RECOVERY_PAGE_SIZE,
+            ..Default::default()
+        };
+
+        let page = loop {
+            match client
+                .lightning()
+                .list_invoices(Request::new(request))
+                .await
+            {
+                Ok(response) => break response.into_inner(),
+                Err(status) => {
+                    tracing::warn!(
+                        error = %status,
+                        index_offset,
+                        "LND ListInvoices failed; retrying pending hold invoice recovery",
+                    );
+                    tokio::time::sleep(SUBSCRIPTION_RETRY_DELAY).await;
+                }
+            }
+        };
+
+        if page.invoices.is_empty() || page.last_index_offset <= index_offset {
+            return;
+        }
+
+        for invoice in &page.invoices {
+            let Ok(payment_hash) = <[u8; 32]>::try_from(invoice.r_hash.as_slice()) else {
+                tracing::warn!("LND returned a pending invoice without a 32-byte hash");
+                continue;
+            };
+
+            let record = watcher
+                .tracker
+                .observe(&payment_hash, HoldStatus::from_invoice(invoice));
+
+            tracing::info!(
+                payment_hash = %hex::encode(payment_hash),
+                hold_state = record.state.as_str(),
+                settle_deadline = ?record.settle_deadline,
+                "recovered a pending LND invoice",
+            );
+
+            watcher.ensure_watching(&payment_hash);
+        }
+
+        index_offset = page.last_index_offset;
+    }
+}
+
+async fn follow_hold_invoice(
+    mut client: client::Client,
+    tracker: Arc<HoldTracker>,
+    events: broadcast::Sender<WaitPaymentResponse>,
+    payment_hash: [u8; 32],
+) {
+    loop {
+        let request = invoicesrpc::SubscribeSingleInvoiceRequest {
+            r_hash: payment_hash.to_vec(),
+        };
+
+        match client
+            .invoices()
+            .subscribe_single_invoice(Request::new(request))
+            .await
+        {
+            Ok(response) => {
+                if follow_invoice(response.into_inner(), &tracker, &events, payment_hash).await {
+                    return;
+                }
+            }
+            Err(status) if status.code() == Code::NotFound => {
+                tracing::warn!(
+                    payment_hash = %hex::encode(payment_hash),
+                    "LND does not know the hold invoice; stopping the subscription",
+                );
+                return;
+            }
+            Err(status) => {
+                tracing::warn!(
+                    payment_hash = %hex::encode(payment_hash),
+                    error = %status,
+                    "LND SubscribeSingleInvoice failed; retrying",
+                );
+            }
+        }
+
+        tokio::time::sleep(SUBSCRIPTION_RETRY_DELAY).await;
+    }
+}
+
+async fn follow_invoice(
+    mut stream: tonic::Streaming<lnrpc::Invoice>,
+    tracker: &HoldTracker,
+    events: &broadcast::Sender<WaitPaymentResponse>,
+    payment_hash: [u8; 32],
+) -> bool {
+    while let Some(message) = stream.next().await {
+        let invoice = match message {
+            Ok(invoice) => invoice,
+            Err(status) => {
+                tracing::warn!(
+                    payment_hash = %hex::encode(payment_hash),
+                    error = %status,
+                    "LND hold invoice subscription closed; resubscribing",
+                );
+                return false;
+            }
+        };
+
+        match follow_action(tracker.observe(&payment_hash, HoldStatus::from_invoice(&invoice))) {
+            FollowAction::Settle => {
+                tracing::info!(
+                    payment_hash = %hex::encode(payment_hash),
+                    amount_msat = invoice.amt_paid_msat,
+                    "LND hold invoice settled",
+                );
+                let _ = events.send(WaitPaymentResponse {
+                    payment_identifier: PaymentIdentifier::PaymentHash(payment_hash),
+                    payment_amount: Amount::new(invoice.amt_paid_msat as u64, CurrencyUnit::Msat),
+                    payment_id: hex::encode(payment_hash),
+                });
+                return true;
+            }
+            FollowAction::Stop => {
+                tracing::info!(
+                    payment_hash = %hex::encode(payment_hash),
+                    "LND hold invoice cancelled",
+                );
+                return true;
+            }
+            FollowAction::Continue => {}
+        }
+    }
+
+    false
+}
+
+async fn poll_block_height(watcher: Watcher) {
+    let mut client = watcher.client.clone();
+
+    loop {
+        tokio::time::sleep(BLOCK_POLL_INTERVAL).await;
+
+        let held = watcher.tracker.held();
+
+        if held.is_empty() {
+            continue;
+        }
+
+        let block_height = match client
+            .lightning()
+            .get_info(Request::new(lnrpc::GetInfoRequest {}))
+            .await
+        {
+            Ok(response) => response.into_inner().block_height,
+            Err(status) => {
+                tracing::warn!(
+                    error = %status,
+                    "LND GetInfo failed; skipping the cancel round",
+                );
+                continue;
+            }
+        };
+
+        for (payment_hash, record) in held {
+            if !record.should_cancel(block_height) {
+                continue;
+            }
+
+            let request = invoicesrpc::CancelInvoiceMsg {
+                payment_hash: payment_hash.to_vec(),
+            };
+
+            match client
+                .invoices()
+                .cancel_invoice(Request::new(request))
+                .await
+            {
+                Ok(_) => {
+                    watcher.tracker.mark_cancelled(&payment_hash);
+                    tracing::info!(
+                        payment_hash = %hex::encode(payment_hash),
+                        block_height,
+                        settle_deadline = ?record.settle_deadline,
+                        "LND hold invoice cancelled after the settle deadline",
+                    );
+                }
+                Err(status) => {
+                    tracing::warn!(
+                        payment_hash = %hex::encode(payment_hash),
+                        block_height,
+                        error = %status,
+                        "LND CancelInvoice failed; retrying on the next round",
+                    );
+                }
+            }
         }
     }
 }
@@ -318,7 +539,7 @@ impl MintPayment for LndHold {
             &self.settings,
         );
 
-        let mut client = self.client.clone();
+        let mut client = self.watcher.client.clone();
         let response = client
             .invoices()
             .add_hold_invoice(Request::new(add_request))
@@ -331,6 +552,11 @@ impl MintPayment for LndHold {
         if bolt11.payment_hash().as_byte_array() != &request.payment_hash {
             return Err(payment::Error::InvalidHash);
         }
+
+        self.watcher
+            .tracker
+            .observe(&request.payment_hash, HoldStatus::unpaid());
+        self.watcher.ensure_watching(&request.payment_hash);
 
         Ok(CreateIncomingPaymentResponse {
             request_lookup_id: PaymentIdentifier::PaymentHash(request.payment_hash),
@@ -362,14 +588,51 @@ impl MintPayment for LndHold {
     async fn wait_payment_event(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Event> + Send>>, Self::Err> {
-        Err(payment::Error::UnsupportedPaymentOption)
+        let receiver = self.watcher.events.subscribe();
+        let cancel = self.event_cancel.clone();
+        let is_active = Arc::clone(&self.event_stream_active);
+
+        let stream = futures::stream::unfold(
+            (receiver, cancel, is_active),
+            |(mut receiver, cancel, is_active)| async move {
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => {
+                            is_active.store(false, Ordering::SeqCst);
+                            return None;
+                        }
+                        received = receiver.recv() => match received {
+                            Ok(response) => {
+                                is_active.store(true, Ordering::SeqCst);
+                                return Some((
+                                    Event::PaymentReceived(response),
+                                    (receiver, cancel, is_active),
+                                ));
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "payment event stream lagged");
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                is_active.store(false, Ordering::SeqCst);
+                                return None;
+                            }
+                        }
+                    }
+                }
+            },
+        );
+
+        self.event_stream_active.store(true, Ordering::SeqCst);
+        Ok(Box::pin(stream))
     }
 
     fn is_payment_event_stream_active(&self) -> bool {
-        false
+        self.event_stream_active.load(Ordering::SeqCst)
     }
 
-    fn cancel_payment_event_stream(&self) {}
+    fn cancel_payment_event_stream(&self) {
+        self.event_cancel.cancel();
+    }
 
     #[instrument(skip(self))]
     async fn check_incoming_payment_status(
@@ -377,21 +640,26 @@ impl MintPayment for LndHold {
         payment_identifier: &PaymentIdentifier,
     ) -> Result<Vec<WaitPaymentResponse>, Self::Err> {
         let payment_hash = payment_hash_from_identifier(payment_identifier)?;
+        self.watcher.ensure_watching(&payment_hash);
 
-        let Some(invoice) = self.lookup_invoice(&payment_hash).await? else {
+        let Some(invoice) = self.watcher.lookup_invoice(&payment_hash).await? else {
             return Ok(Vec::new());
         };
 
-        let status = HoldStatus::from_invoice(&invoice);
+        let record = self
+            .watcher
+            .tracker
+            .observe(&payment_hash, HoldStatus::from_invoice(&invoice));
 
         tracing::debug!(
             payment_hash = %payment_identifier,
-            hold_state = status.state.as_str(),
-            min_htlc_expiry_height = ?status.min_htlc_expiry_height,
+            hold_state = record.state.as_str(),
+            min_htlc_expiry_height = ?record.min_htlc_expiry_height,
+            settle_deadline = ?record.settle_deadline,
             "checked LND hold invoice",
         );
 
-        if !status.is_settled() {
+        if record.state != HoldState::Settled {
             return Ok(Vec::new());
         }
 
@@ -408,16 +676,20 @@ impl MintPayment for LndHold {
         payment_identifier: &PaymentIdentifier,
     ) -> Result<Option<Value>, Self::Err> {
         let payment_hash = payment_hash_from_identifier(payment_identifier)?;
+        self.watcher.ensure_watching(&payment_hash);
 
-        let status = match self.lookup_invoice(&payment_hash).await? {
-            Some(invoice) => HoldStatus::from_invoice(&invoice),
-            None => HoldStatus {
-                state: HoldState::Unpaid,
-                min_htlc_expiry_height: None,
-            },
+        let record = match self.watcher.lookup_invoice(&payment_hash).await? {
+            Some(invoice) => self
+                .watcher
+                .tracker
+                .observe(&payment_hash, HoldStatus::from_invoice(&invoice)),
+            None => self
+                .watcher
+                .tracker
+                .observe(&payment_hash, HoldStatus::unpaid()),
         };
 
-        Ok(Some(status.extra_json()))
+        Ok(Some(record.extra_json()))
     }
 
     async fn check_outgoing_payment(
@@ -444,33 +716,51 @@ mod tests {
         hex::encode([7u8; 32])
     }
 
-    fn invoice(
-        state: lnrpc::invoice::InvoiceState,
-        htlcs: Vec<lnrpc::InvoiceHtlc>,
-    ) -> lnrpc::Invoice {
-        lnrpc::Invoice {
-            state: state as i32,
-            htlcs,
-            ..Default::default()
-        }
-    }
-
-    fn htlc(state: lnrpc::InvoiceHtlcState, expiry_height: i32) -> lnrpc::InvoiceHtlc {
-        lnrpc::InvoiceHtlc {
-            state: state as i32,
-            expiry_height,
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn settings_expose_hold_options() {
         let options = Settings::default().options_json();
 
         assert_eq!(options["min_final_cltv_expiry_delta"], 144);
         assert_eq!(options["max_final_cltv_expiry_delta"], 576);
-        assert_eq!(options["settle_margin_blocks"], 12);
+        assert_eq!(options["settle_margin_blocks"], 22);
         assert_eq!(options["max_pending_quotes"], 100);
+    }
+
+    #[test]
+    fn settings_reject_margin_at_or_below_lnd_hold_expiry_delta() {
+        assert!(validate_settings(&Settings::default()).is_ok());
+
+        for settle_margin_blocks in [18, 17, 0] {
+            let settings = Settings {
+                settle_margin_blocks,
+                ..Settings::default()
+            };
+
+            assert!(
+                matches!(validate_settings(&settings), Err(payment::Error::Custom(_))),
+                "{settle_margin_blocks}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_margin_cancels_before_lnd_hold_expiry() {
+        let settings = Settings::default();
+        let min_htlc_expiry_height = 1_000_i32;
+        let lnd_cancel_height =
+            u32::try_from(min_htlc_expiry_height).unwrap() - settings.lnd_hold_expiry_delta;
+
+        let record = hold::HoldRecord::from_status(
+            hold::HoldStatus {
+                state: hold::HoldState::Held,
+                min_htlc_expiry_height: Some(min_htlc_expiry_height),
+            },
+            settings.settle_margin_blocks,
+        );
+        let deadline = record.settle_deadline.expect("held invoice has a deadline");
+
+        assert!(deadline < lnd_cancel_height);
+        assert!(record.should_cancel(lnd_cancel_height - 1));
     }
 
     #[test]
@@ -584,79 +874,5 @@ mod tests {
             ),
             Err(payment::Error::UnsupportedUnit)
         ));
-    }
-
-    #[test]
-    fn open_invoice_is_unpaid() {
-        let status =
-            HoldStatus::from_invoice(&invoice(lnrpc::invoice::InvoiceState::Open, Vec::new()));
-
-        assert_eq!(status.state, HoldState::Unpaid);
-        assert_eq!(status.state.as_str(), "UNPAID");
-        assert_eq!(status.min_htlc_expiry_height, None);
-        assert!(!status.is_settled());
-    }
-
-    #[test]
-    fn accepted_invoice_is_held_with_lowest_accepted_expiry() {
-        let status = HoldStatus::from_invoice(&invoice(
-            lnrpc::invoice::InvoiceState::Accepted,
-            vec![
-                htlc(lnrpc::InvoiceHtlcState::Accepted, 120),
-                htlc(lnrpc::InvoiceHtlcState::Accepted, 100),
-                htlc(lnrpc::InvoiceHtlcState::Settled, 50),
-            ],
-        ));
-
-        assert_eq!(status.state, HoldState::Held);
-        assert_eq!(status.state.as_str(), "HELD");
-        assert_eq!(status.min_htlc_expiry_height, Some(100));
-        assert!(!status.is_settled());
-    }
-
-    #[test]
-    fn accepted_invoice_without_accepted_htlcs_has_no_expiry() {
-        let status = HoldStatus::from_invoice(&invoice(
-            lnrpc::invoice::InvoiceState::Accepted,
-            vec![htlc(lnrpc::InvoiceHtlcState::Canceled, 100)],
-        ));
-
-        assert_eq!(status.state, HoldState::Held);
-        assert_eq!(status.min_htlc_expiry_height, None);
-    }
-
-    #[test]
-    fn settled_invoice_is_settled() {
-        let status = HoldStatus::from_invoice(&invoice(
-            lnrpc::invoice::InvoiceState::Settled,
-            vec![htlc(lnrpc::InvoiceHtlcState::Settled, 100)],
-        ));
-
-        assert_eq!(status.state, HoldState::Settled);
-        assert_eq!(status.state.as_str(), "SETTLED");
-        assert!(status.is_settled());
-    }
-
-    #[test]
-    fn canceled_invoice_is_cancelled() {
-        let status =
-            HoldStatus::from_invoice(&invoice(lnrpc::invoice::InvoiceState::Canceled, Vec::new()));
-
-        assert_eq!(status.state, HoldState::Cancelled);
-        assert_eq!(status.state.as_str(), "CANCELLED");
-        assert!(!status.is_settled());
-    }
-
-    #[test]
-    fn hold_status_extra_json_reports_state_and_expiry() {
-        let status = HoldStatus {
-            state: HoldState::Held,
-            min_htlc_expiry_height: Some(870_420),
-        };
-
-        assert_eq!(
-            status.extra_json(),
-            json!({"hold_state": "HELD", "min_htlc_expiry_height": 870_420})
-        );
     }
 }
