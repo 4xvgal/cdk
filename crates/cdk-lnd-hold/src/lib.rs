@@ -170,9 +170,7 @@ fn validate_request(
     if !(settings.min_final_cltv_expiry_delta..=settings.max_final_cltv_expiry_delta)
         .contains(&cltv_expiry_delta)
     {
-        return Err(invalid(
-            "min_final_cltv_expiry_delta outside of allowed range",
-        ));
+        return Err(payment::Error::InvalidCltvDelta);
     }
 
     Ok(HoldInvoiceRequest {
@@ -206,6 +204,13 @@ fn parse_preimage(preimage: &str, payment_hash: &[u8; 32]) -> Result<[u8; 32], p
 
 fn is_already_cancelled(status: &tonic::Status) -> bool {
     status.message().to_lowercase().contains("already cancel")
+}
+
+fn is_hash_already_used(status: &tonic::Status) -> bool {
+    status
+        .message()
+        .to_lowercase()
+        .contains("invoice with that hash already exists")
 }
 
 fn is_already_settled(status: &tonic::Status) -> bool {
@@ -731,7 +736,13 @@ impl MintPayment for LndHold {
             .invoices()
             .add_hold_invoice(Request::new(add_request))
             .await
-            .map_err(|status| invalid(&format!("LND AddHoldInvoice failed: {status}")))?
+            .map_err(|status| {
+                if is_hash_already_used(&status) {
+                    return payment::Error::PaymentHashAlreadyUsed;
+                }
+
+                invalid(&format!("LND AddHoldInvoice failed: {status}"))
+            })?
             .into_inner();
 
         let bolt11 = Bolt11Invoice::from_str(&response.payment_request)?;
@@ -1049,11 +1060,16 @@ mod tests {
             ))
             .expect_err("cltv outside range");
 
-            assert!(
-                matches!(error, payment::Error::Custom(ref message) if message.contains("allowed range")),
-                "{cltv}"
-            );
+            assert!(matches!(error, payment::Error::InvalidCltvDelta), "{cltv}");
         }
+    }
+
+    #[test]
+    fn duplicate_hash_status_maps_to_payment_hash_already_used() {
+        let status = tonic::Status::unknown("invoice with that hash already exists (hash=07)");
+
+        assert!(is_hash_already_used(&status));
+        assert!(!is_hash_already_used(&tonic::Status::unknown("other")));
     }
 
     #[test]

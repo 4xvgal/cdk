@@ -57,6 +57,12 @@ pub enum Error {
     /// Held incoming payment passed its settle deadline
     #[error("Settle deadline has passed")]
     SettleDeadlinePassed,
+    /// Payment hash is already used by another quote
+    #[error("Payment hash already used")]
+    PaymentHashAlreadyUsed,
+    /// Final CLTV expiry delta is outside of the allowed range
+    #[error("Final CLTV expiry delta is outside of the allowed range")]
+    InvalidCltvDelta,
     /// Payment backend error
     #[error(transparent)]
     Backend(Box<dyn std::error::Error + Send + Sync>),

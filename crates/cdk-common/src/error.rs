@@ -714,6 +714,16 @@ mod tests {
                 ErrorCode::SettleDeadlinePassed,
                 20014,
             ),
+            (
+                crate::payment::Error::PaymentHashAlreadyUsed,
+                ErrorCode::PaymentHashAlreadyUsed,
+                20015,
+            ),
+            (
+                crate::payment::Error::InvalidCltvDelta,
+                ErrorCode::InvalidCltvDelta,
+                20016,
+            ),
         ] {
             let response = ErrorResponse::from(Error::Payment(error));
 
@@ -729,6 +739,20 @@ mod tests {
             ErrorCode::PaymentHashAlreadyUsed
         );
         assert_eq!(ErrorCode::from_code(20016), ErrorCode::InvalidCltvDelta);
+        assert!(matches!(
+            Error::from(ErrorResponse {
+                code: ErrorCode::PaymentHashAlreadyUsed,
+                detail: String::new(),
+            }),
+            Error::Payment(crate::payment::Error::PaymentHashAlreadyUsed)
+        ));
+        assert!(matches!(
+            Error::from(ErrorResponse {
+                code: ErrorCode::InvalidCltvDelta,
+                detail: String::new(),
+            }),
+            Error::Payment(crate::payment::Error::InvalidCltvDelta)
+        ));
     }
 }
 
@@ -1198,6 +1222,16 @@ impl From<Error> for ErrorResponse {
                 detail: err.to_string(),
             },
             #[cfg(feature = "mint")]
+            Error::Payment(crate::payment::Error::PaymentHashAlreadyUsed) => ErrorResponse {
+                code: ErrorCode::PaymentHashAlreadyUsed,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "mint")]
+            Error::Payment(crate::payment::Error::InvalidCltvDelta) => ErrorResponse {
+                code: ErrorCode::InvalidCltvDelta,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "mint")]
             Error::Payment(payment_error) => {
                 tracing::error!(error = %payment_error, "Payment backend error");
                 ErrorResponse {
@@ -1356,6 +1390,12 @@ impl From<ErrorResponse> for Error {
             ErrorCode::SettleDeadlinePassed => {
                 Self::Payment(crate::payment::Error::SettleDeadlinePassed)
             }
+            #[cfg(feature = "mint")]
+            ErrorCode::PaymentHashAlreadyUsed => {
+                Self::Payment(crate::payment::Error::PaymentHashAlreadyUsed)
+            }
+            #[cfg(feature = "mint")]
+            ErrorCode::InvalidCltvDelta => Self::Payment(crate::payment::Error::InvalidCltvDelta),
             // 30xxx - Clear auth errors
             ErrorCode::ClearAuthRequired => Self::ClearAuthRequired,
             ErrorCode::ClearAuthFailed => Self::ClearAuthFailed,

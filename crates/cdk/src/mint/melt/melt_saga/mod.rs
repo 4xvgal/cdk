@@ -7,8 +7,8 @@ use cdk_common::nut00::KnownMethod;
 use cdk_common::nuts::MeltQuoteState;
 use cdk_common::payment::OutgoingPaymentOptions;
 use cdk_common::{
-    Amount, CurrencyUnit, Error, ProofsMethods, PublicKey, QuoteId, SpendingConditionVerification,
-    State,
+    Amount, CurrencyUnit, Error, PaymentMethod, ProofsMethods, PublicKey, QuoteId,
+    SpendingConditionVerification, State,
 };
 #[cfg(feature = "prometheus")]
 use cdk_prometheus::MintMetricGuard;
@@ -461,12 +461,14 @@ impl MeltSaga<SetupComplete> {
     ///
     /// This checks if the payment request corresponds to an existing mint quote
     /// on the same mint, and if so, settles it atomically within a transaction.
+    /// Quotes of custom methods, including `bolt11_hold` invoices, are never
+    /// settled internally.
     ///
     /// # What This Does
     ///
     /// Within a single database transaction:
     /// 1. Locks the melt quote row and verifies it is still `Pending`
-    /// 2. Checks if payment request matches a mint quote on this mint
+    /// 2. Checks if payment request matches a non-custom mint quote on this mint
     /// 3. If not a match or different unit: returns (self, RequiresExternalPayment)
     /// 4. If match found: validates quote state and amount
     /// 5. Increments the mint quote's paid amount
@@ -529,7 +531,12 @@ impl MeltSaga<SetupComplete> {
             .get_mint_quote_by_request(&self.state_data.quote.request.to_string())
             .await
         {
-            Ok(Some(mint_quote)) if mint_quote.unit == self.state_data.quote.unit => mint_quote,
+            Ok(Some(mint_quote))
+                if mint_quote.unit == self.state_data.quote.unit
+                    && !matches!(mint_quote.payment_method, PaymentMethod::Custom(_)) =>
+            {
+                mint_quote
+            }
             Ok(_) => {
                 tx.rollback().await?;
                 tracing::debug!("Not an internal payment or unit mismatch");
@@ -546,7 +553,7 @@ impl MeltSaga<SetupComplete> {
         // Mint quote has already been settled
         if (mint_quote.state() == cdk_common::nuts::MintQuoteState::Issued
             || mint_quote.state() == cdk_common::nuts::MintQuoteState::Paid)
-            && mint_quote.payment_method == crate::mint::PaymentMethod::Known(KnownMethod::Bolt11)
+            && mint_quote.payment_method == PaymentMethod::Known(KnownMethod::Bolt11)
         {
             tx.rollback().await?;
             self.compensate_all().await?;

@@ -4,7 +4,7 @@ use cdk_common::database::mint::Acquired;
 use cdk_common::mint::{MintQuote, Operation};
 use cdk_common::payment::{
     Bolt11IncomingPaymentOptions, Bolt12IncomingPaymentOptions, CustomIncomingPaymentOptions,
-    IncomingPaymentOptions, OnchainIncomingPaymentOptions, WaitPaymentResponse,
+    IncomingPaymentOptions, OnchainIncomingPaymentOptions, PaymentIdentifier, WaitPaymentResponse,
 };
 use cdk_common::quote_id::QuoteId;
 use cdk_common::util::unix_time;
@@ -346,7 +346,12 @@ impl Mint {
                 .await
                 .map_err(|err| {
                     tracing::error!("Could not create invoice: {}", err);
-                    Error::InvalidPaymentRequest
+
+                    match err {
+                        err @ (cdk_common::payment::Error::PaymentHashAlreadyUsed
+                        | cdk_common::payment::Error::InvalidCltvDelta) => Error::Payment(err),
+                        _ => Error::InvalidPaymentRequest,
+                    }
                 })?;
 
             let now = unix_time();
@@ -369,6 +374,26 @@ impl Mint {
             );
 
             let mut tx = self.localstore.begin_transaction().await?;
+
+            if matches!(payment_method, PaymentMethod::Custom(_)) {
+                let lookup_id = &create_invoice_response.request_lookup_id;
+
+                if matches!(lookup_id, PaymentIdentifier::PaymentHash(_))
+                    && (tx
+                        .get_mint_quote_by_request_lookup_id(lookup_id)
+                        .await?
+                        .is_some()
+                        || !tx
+                            .get_melt_quotes_by_request_lookup_id(lookup_id)
+                            .await?
+                            .is_empty())
+                {
+                    return Err(Error::Payment(
+                        cdk_common::payment::Error::PaymentHashAlreadyUsed,
+                    ));
+                }
+            }
+
             tx.add_mint_quote(quote.clone()).await?;
             tx.commit().await?;
 

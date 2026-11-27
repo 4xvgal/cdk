@@ -33,6 +33,8 @@ use crate::types::PaymentProcessorKey;
 use crate::util::unix_time;
 use crate::{ensure_cdk, Amount, Error};
 
+const BOLT11_HOLD_METHOD: &str = "bolt11_hold";
+
 pub(crate) mod melt_saga;
 pub(crate) mod shared;
 
@@ -178,13 +180,24 @@ impl Mint {
             .get_settings(&unit, &method)
             .ok_or(Error::UnsupportedUnit)?;
 
+        let mint_quote = self.localstore.get_mint_quote_by_request(&request).await?;
+
+        if mint_quote
+            .as_ref()
+            .is_some_and(|quote| matches!(&quote.payment_method, PaymentMethod::Custom(quote_method) if quote_method == BOLT11_HOLD_METHOD))
+        {
+            return Err(Error::Payment(
+                cdk_common::payment::Error::PaymentHashAlreadyUsed,
+            ));
+        }
+
         match options {
             Some(MeltOptions::Mpp { mpp: _ }) => {
                 let nut15 = mint_info.nuts.nut15;
                 // Verify there is no corresponding mint quote.
                 // Otherwise a wallet is trying to pay someone internally, but
                 // with a multi-part quote. And that's just not possible.
-                if (self.localstore.get_mint_quote_by_request(&request).await?).is_some() {
+                if mint_quote.is_some() {
                     return Err(Error::InternalMultiPartMeltQuote);
                 }
                 // Verify MPP is enabled for unit and method

@@ -1353,7 +1353,6 @@ mod tests {
     }
 
     const HOLD_METHOD: &str = "bolt11_hold";
-    const HOLD_LOOKUP_ID: &str = "hold-lookup-id";
     const HOLD_AMOUNT_SAT: u64 = 21;
     const HOLD_SETTLE_DEADLINE: u64 = 870_420;
     const HOLD_PAYMENT_HASH: &str =
@@ -1368,6 +1367,17 @@ mod tests {
         NotHeld,
         Cancelled,
         DeadlinePassed,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum CreateBehavior {
+        Create,
+        DuplicateHash,
+        InvalidCltv,
+    }
+
+    fn hold_lookup_id() -> PaymentIdentifier {
+        PaymentIdentifier::new("payment_hash", HOLD_PAYMENT_HASH).expect("valid payment hash")
     }
 
     fn unpaid_hold_extra() -> Value {
@@ -1396,14 +1406,20 @@ mod tests {
 
     struct HoldBackend {
         behavior: SettleBehavior,
+        create: CreateBehavior,
         settled: Arc<AtomicBool>,
         check_extra: Arc<Mutex<Value>>,
     }
 
     impl HoldBackend {
         fn new(behavior: SettleBehavior) -> Self {
+            Self::with_create(behavior, CreateBehavior::Create)
+        }
+
+        fn with_create(behavior: SettleBehavior, create: CreateBehavior) -> Self {
             Self {
                 behavior,
+                create,
                 settled: Arc::new(AtomicBool::new(false)),
                 check_extra: Arc::new(Mutex::new(unpaid_hold_extra())),
             }
@@ -1428,13 +1444,21 @@ mod tests {
             &self,
             options: IncomingPaymentOptions,
         ) -> Result<CreateIncomingPaymentResponse, Self::Err> {
-            match options {
-                IncomingPaymentOptions::Custom(_) => Ok(CreateIncomingPaymentResponse {
-                    request_lookup_id: PaymentIdentifier::CustomId(HOLD_LOOKUP_ID.to_string()),
-                    request: "bolt11-hold-request".to_string(),
-                    expiry: Some(10_000),
-                    extra_json: Some(unpaid_hold_extra()),
-                }),
+            match (self.create, options) {
+                (CreateBehavior::DuplicateHash, IncomingPaymentOptions::Custom(_)) => {
+                    Err(cdk_payment::Error::PaymentHashAlreadyUsed)
+                }
+                (CreateBehavior::InvalidCltv, IncomingPaymentOptions::Custom(_)) => {
+                    Err(cdk_payment::Error::InvalidCltvDelta)
+                }
+                (CreateBehavior::Create, IncomingPaymentOptions::Custom(_)) => {
+                    Ok(CreateIncomingPaymentResponse {
+                        request_lookup_id: hold_lookup_id(),
+                        request: "bolt11-hold-request".to_string(),
+                        expiry: Some(10_000),
+                        extra_json: Some(unpaid_hold_extra()),
+                    })
+                }
                 _ => Err(cdk_payment::Error::UnsupportedPaymentOption),
             }
         }
@@ -1533,9 +1557,13 @@ mod tests {
     }
 
     async fn create_hold_state(behavior: SettleBehavior) -> (MintState, Arc<Mutex<Value>>) {
+        create_hold_state_with(HoldBackend::new(behavior)).await
+    }
+
+    async fn create_hold_state_with(backend: HoldBackend) -> (MintState, Arc<Mutex<Value>>) {
         let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
         let mut builder = MintBuilder::new(db.clone());
-        let backend = Arc::new(HoldBackend::new(behavior));
+        let backend = Arc::new(backend);
         let check_extra = Arc::clone(&backend.check_extra);
 
         builder
@@ -1568,6 +1596,12 @@ mod tests {
 
     async fn create_test_state_with_hold_backend(behavior: SettleBehavior) -> MintState {
         create_hold_state(behavior).await.0
+    }
+
+    async fn create_hold_state_with_create(create: CreateBehavior) -> MintState {
+        create_hold_state_with(HoldBackend::with_create(SettleBehavior::Settle, create))
+            .await
+            .0
     }
 
     async fn settle_hold_quote(
@@ -1791,5 +1825,188 @@ mod tests {
         .expect_err("an unknown quote must not be settled");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn hold_outputs(state: &MintState, amounts: &[u64]) -> Vec<BlindedMessage> {
+        let keyset_id = *state
+            .mint
+            .get_active_keysets()
+            .get(&CurrencyUnit::Sat)
+            .unwrap();
+
+        amounts
+            .iter()
+            .map(|amount| {
+                BlindedMessage::new(
+                    Amount::from(*amount),
+                    keyset_id,
+                    SecretKey::generate().public_key(),
+                )
+            })
+            .collect()
+    }
+
+    async fn create_hold_quote_request(state: &MintState) -> Result<Response, Response> {
+        post_mint_custom_quote(
+            AuthHeader::None,
+            State(state.clone()),
+            Path(HOLD_METHOD.to_string()),
+            Json(serde_json::json!({
+                "amount": HOLD_AMOUNT_SAT,
+                "unit": CurrencyUnit::Sat,
+                "payment_hash": HOLD_PAYMENT_HASH,
+            })),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn post_mint_custom_quote_rejects_a_payment_hash_used_by_a_mint_quote() {
+        let state = create_test_state_with_hold_backend(SettleBehavior::Settle).await;
+        create_custom_quote(&state, HOLD_METHOD, HOLD_AMOUNT_SAT).await;
+
+        let response = create_hold_quote_request(&state)
+            .await
+            .expect_err("a reused payment hash must be rejected");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value = response_json(response).await;
+        assert_eq!(value["code"].as_u64(), Some(20015));
+    }
+
+    #[tokio::test]
+    async fn post_mint_custom_quote_rejects_a_payment_hash_used_by_a_melt_quote() {
+        let state = create_test_state_with_hold_backend(SettleBehavior::Settle).await;
+
+        let mut tx = state.mint.localstore().begin_transaction().await.unwrap();
+        tx.add_melt_quote(cdk_common::mint::MeltQuote::new(
+            None,
+            cdk_common::mint::MeltPaymentRequest::Bolt11 {
+                bolt11: cdk_fake_wallet::create_fake_invoice(1_000, "melt".to_string()),
+            },
+            CurrencyUnit::Sat,
+            Amount::new(1, CurrencyUnit::Sat),
+            Amount::new(1, CurrencyUnit::Sat),
+            cdk_common::util::unix_time() + 3_600,
+            Some(hold_lookup_id()),
+            None,
+            PaymentMethod::Known(KnownMethod::Bolt11),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let response = create_hold_quote_request(&state)
+            .await
+            .expect_err("a payment hash used by a melt quote must be rejected");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value = response_json(response).await;
+        assert_eq!(value["code"].as_u64(), Some(20015));
+    }
+
+    #[tokio::test]
+    async fn post_mint_custom_quote_maps_backend_create_errors_to_nutxx_codes() {
+        for (create, expected_code) in [
+            (CreateBehavior::DuplicateHash, 20015),
+            (CreateBehavior::InvalidCltv, 20016),
+        ] {
+            let state = create_hold_state_with_create(create).await;
+
+            let response = create_hold_quote_request(&state)
+                .await
+                .expect_err("a rejected backend create must not return a quote");
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = response_json(response).await;
+            assert_eq!(value["code"].as_u64(), Some(expected_code), "{create:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_mint_custom_quote_issues_a_settled_quote_after_expiry() {
+        let state = create_test_state_with_hold_backend(SettleBehavior::Settle).await;
+        let quote_id = create_custom_quote(&state, HOLD_METHOD, HOLD_AMOUNT_SAT).await;
+
+        post_settle_mint_custom_quote(
+            AuthHeader::None,
+            State(state.clone()),
+            Path((HOLD_METHOD.to_string(), quote_id.clone())),
+            Json(serde_json::json!({ "preimage": HOLD_PREIMAGE })),
+        )
+        .await
+        .expect("settling a held quote must succeed");
+
+        let settled = state
+            .mint
+            .localstore()
+            .get_mint_quote(&quote_id)
+            .await
+            .unwrap()
+            .expect("settled quote");
+        assert!(
+            settled.expiry < cdk_common::util::unix_time(),
+            "the quote must be past its expiry to exercise the gate"
+        );
+        assert_eq!(
+            settled.amount_paid(),
+            Amount::new(HOLD_AMOUNT_SAT, CurrencyUnit::Sat)
+        );
+
+        let mut tx = state.mint.localstore().begin_transaction().await.unwrap();
+        let mut quote = tx
+            .get_mint_quote(&quote_id)
+            .await
+            .unwrap()
+            .expect("settled quote");
+        quote.merge_extra(serde_json::json!({
+            "hold_state": "HELD",
+            "settle_deadline": HOLD_SETTLE_DEADLINE,
+        }));
+        tx.update_mint_quote_extra(&mut quote).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let stale = state
+            .mint
+            .localstore()
+            .get_mint_quote(&quote_id)
+            .await
+            .unwrap()
+            .expect("settled quote");
+        assert_eq!(
+            stale.extra_json.as_ref().unwrap()["hold_state"].as_str(),
+            Some("HELD"),
+            "the gate must not depend on the stored hold state"
+        );
+
+        let response = cache_post_mint_custom(
+            AuthHeader::None,
+            State(state.clone()),
+            Path(HOLD_METHOD.to_string()),
+            Json(MintRequest {
+                quote: quote_id.clone(),
+                outputs: hold_outputs(&state, &[16, 4, 1]),
+                signature: None,
+            }),
+        )
+        .await
+        .expect("a settled hold quote must be mintable after expiry");
+
+        assert_eq!(response.0.signatures.len(), 3);
+
+        let issued = state
+            .mint
+            .localstore()
+            .get_mint_quote(&quote_id)
+            .await
+            .unwrap()
+            .expect("issued quote");
+        assert_eq!(issued.state(), MintQuoteState::Issued);
+        assert_eq!(
+            issued.amount_issued(),
+            Amount::new(HOLD_AMOUNT_SAT, CurrencyUnit::Sat)
+        );
     }
 }

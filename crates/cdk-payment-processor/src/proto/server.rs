@@ -297,7 +297,19 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
             .inner
             .create_incoming_payment_request(proto_options)
             .await
-            .map_err(|_| Status::internal("Could not create invoice"))?;
+            .map_err(|err| {
+                tracing::error!("Could not create invoice: {}", err);
+
+                match err {
+                    cdk_common::payment::Error::PaymentHashAlreadyUsed => {
+                        Status::already_exists(CREATE_PAYMENT_HASH_ALREADY_USED)
+                    }
+                    cdk_common::payment::Error::InvalidCltvDelta => {
+                        Status::invalid_argument(CREATE_INVALID_CLTV_DELTA)
+                    }
+                    _ => Status::internal("Could not create invoice"),
+                }
+            })?;
 
         Ok(Response::new(invoice_response.into()))
     }

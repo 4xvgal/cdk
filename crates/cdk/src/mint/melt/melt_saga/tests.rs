@@ -1415,6 +1415,114 @@ async fn test_rollback_refused_after_internal_settlement() {
     assert_eq!(final_quote.state, MeltQuoteState::Paid);
 }
 
+#[tokio::test]
+async fn test_hold_mint_quote_is_not_settled_internally() {
+    let mint = create_test_mint().await.unwrap();
+    let proofs = mint_test_proofs(&mint, Amount::from(10_000)).await.unwrap();
+
+    let invoice = create_fake_invoice(4_000, "hold".to_string());
+    let request = invoice.to_string();
+    let now = unix_time();
+    let lookup_id = PaymentIdentifier::PaymentHash(*invoice.payment_hash().as_ref());
+
+    let mut tx = mint.localstore.begin_transaction().await.unwrap();
+    tx.add_mint_quote(cdk_common::mint::MintQuote::new(
+        None,
+        request.clone(),
+        CurrencyUnit::Sat,
+        Some(Amount::new(4_000, CurrencyUnit::Sat)),
+        now + 3_600,
+        lookup_id.clone(),
+        None,
+        Amount::new(0, CurrencyUnit::Sat),
+        Amount::new(0, CurrencyUnit::Sat),
+        PaymentMethod::Custom("bolt11_hold".to_string()),
+        now,
+        now,
+        vec![],
+        vec![],
+        None,
+    ))
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let err = mint
+        .get_melt_quote(MeltQuoteRequest::Bolt11(MeltQuoteBolt11Request {
+            request: invoice.clone(),
+            unit: CurrencyUnit::Sat,
+            options: None,
+        }))
+        .await
+        .expect_err("a melt quote for our own hold invoice must be rejected");
+    assert!(matches!(
+        err,
+        cdk_common::Error::Payment(cdk_common::payment::Error::PaymentHashAlreadyUsed)
+    ));
+
+    let melt_quote = MeltQuote::new(
+        None,
+        MeltPaymentRequest::Bolt11 { bolt11: invoice },
+        CurrencyUnit::Sat,
+        Amount::new(4_000, CurrencyUnit::Sat),
+        Amount::new(1, CurrencyUnit::Sat),
+        now + 3_600,
+        Some(lookup_id),
+        None,
+        PaymentMethod::Known(KnownMethod::Bolt11),
+        None,
+        None,
+    );
+    let mut tx = mint.localstore.begin_transaction().await.unwrap();
+    tx.add_melt_quote(melt_quote.clone()).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let melt_request = create_test_melt_request(&proofs, &melt_quote);
+    let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
+    let setup_saga = MeltSaga::new(
+        std::sync::Arc::new(mint.clone()),
+        mint.localstore(),
+        mint.pubsub_manager(),
+    )
+    .setup_melt(
+        &melt_request,
+        verification,
+        PaymentMethod::Known(KnownMethod::Bolt11),
+    )
+    .await
+    .expect("Setup should succeed");
+
+    let (_payment_saga, decision) = setup_saga
+        .attempt_internal_settlement(&melt_request)
+        .await
+        .expect("a hold invoice must not abort the melt");
+    assert!(matches!(
+        decision,
+        crate::mint::melt::melt_saga::state::SettlementDecision::RequiresExternalPayment
+    ));
+
+    let hold_quote = mint
+        .localstore
+        .get_mint_quote_by_request(&request)
+        .await
+        .unwrap()
+        .expect("hold mint quote should exist");
+    assert_eq!(hold_quote.state(), MintQuoteState::Unpaid);
+    assert_eq!(
+        hold_quote.amount_paid(),
+        Amount::new(0, CurrencyUnit::Sat),
+        "internal settlement must not credit a hold mint quote"
+    );
+
+    let melt_quote_after = mint
+        .localstore
+        .get_melt_quote(&melt_quote.id)
+        .await
+        .unwrap()
+        .expect("Melt quote should exist");
+    assert_eq!(melt_quote_after.state, MeltQuoteState::Pending);
+}
+
 // ============================================================================
 // Startup Integration Tests
 // ============================================================================

@@ -24,7 +24,8 @@ use crate::proto::cdk_payment_processor_client::CdkPaymentProcessorClient;
 use crate::proto::{
     CheckIncomingPaymentRequest, CheckOutgoingPaymentRequest, CreatePaymentRequest, EmptyRequest,
     IncomingPaymentOptions, IntoProtoAmount, MakePaymentRequest, OutgoingPaymentRequestType,
-    PaymentQuoteRequest, SettleIncomingRequest, SETTLE_DEADLINE_PASSED, SETTLE_HOLD_CANCELLED,
+    PaymentQuoteRequest, SettleIncomingRequest, CREATE_INVALID_CLTV_DELTA,
+    CREATE_PAYMENT_HASH_ALREADY_USED, SETTLE_DEADLINE_PASSED, SETTLE_HOLD_CANCELLED,
     SETTLE_HOLD_NOT_HELD, SETTLE_PREIMAGE_MISMATCH,
 };
 
@@ -229,7 +230,16 @@ impl MintPayment for PaymentProcessorClient {
             .await
             .map_err(|err| {
                 tracing::error!("Could not create payment request: {}", err);
-                cdk_common::payment::Error::Custom(err.to_string())
+
+                match (err.code(), err.message()) {
+                    (Code::AlreadyExists, CREATE_PAYMENT_HASH_ALREADY_USED) => {
+                        cdk_common::payment::Error::PaymentHashAlreadyUsed
+                    }
+                    (Code::InvalidArgument, CREATE_INVALID_CLTV_DELTA) => {
+                        cdk_common::payment::Error::InvalidCltvDelta
+                    }
+                    _ => cdk_common::payment::Error::Custom(err.to_string()),
+                }
             })?;
 
         let response = response.into_inner();
