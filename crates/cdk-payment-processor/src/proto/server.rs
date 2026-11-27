@@ -560,8 +560,16 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
             .await
             .map_err(|_| Status::internal("Could not check incoming payment status"))?;
 
+        let extra_json = self
+            .inner
+            .check_incoming_payment_extra(&payment_identifier)
+            .await
+            .map_err(|_| Status::internal("Could not check incoming payment status"))?
+            .map(|value| value.to_string());
+
         Ok(Response::new(CheckIncomingPaymentResponse {
             payments: check_responses.into_iter().map(|r| r.into()).collect(),
+            extra_json,
         }))
     }
 
@@ -1005,5 +1013,113 @@ mod tests {
         ] {
             assert_forwarding_stops(state, true).await;
         }
+    }
+
+    struct CheckExtraPayment {
+        extra: Option<serde_json::Value>,
+    }
+
+    #[async_trait]
+    impl MintPayment for CheckExtraPayment {
+        type Err = payment::Error;
+
+        async fn get_settings(&self) -> Result<payment::SettingsResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn create_incoming_payment_request(
+            &self,
+            _options: IncomingPaymentOptions,
+        ) -> Result<payment::CreateIncomingPaymentResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn get_payment_quote(
+            &self,
+            _unit: &CurrencyUnit,
+            _options: payment::OutgoingPaymentOptions,
+        ) -> Result<payment::PaymentQuoteResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn make_payment(
+            &self,
+            _unit: &CurrencyUnit,
+            _options: payment::OutgoingPaymentOptions,
+        ) -> Result<payment::MakePaymentResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn wait_payment_event(
+            &self,
+        ) -> Result<Pin<Box<dyn Stream<Item = payment::Event> + Send>>, Self::Err> {
+            unimplemented!()
+        }
+
+        fn is_payment_event_stream_active(&self) -> bool {
+            unimplemented!()
+        }
+
+        fn cancel_payment_event_stream(&self) {}
+
+        async fn check_incoming_payment_status(
+            &self,
+            _payment_identifier: &payment::PaymentIdentifier,
+        ) -> Result<Vec<payment::WaitPaymentResponse>, Self::Err> {
+            Ok(Vec::new())
+        }
+
+        async fn check_incoming_payment_extra(
+            &self,
+            _payment_identifier: &payment::PaymentIdentifier,
+        ) -> Result<Option<serde_json::Value>, payment::Error> {
+            Ok(self.extra.clone())
+        }
+
+        async fn check_outgoing_payment(
+            &self,
+            _payment_identifier: &payment::PaymentIdentifier,
+        ) -> Result<payment::MakePaymentResponse, Self::Err> {
+            unimplemented!()
+        }
+    }
+
+    fn check_incoming_request() -> CheckIncomingPaymentRequest {
+        CheckIncomingPaymentRequest {
+            request_identifier: Some(super::PaymentIdentifier {
+                r#type: super::PaymentIdentifierType::Label.into(),
+                value: Some(super::payment_identifier::Value::Id("lookup".to_string())),
+            }),
+        }
+    }
+
+    fn check_server(extra: Option<serde_json::Value>) -> PaymentProcessorServer {
+        PaymentProcessorServer::new(Arc::new(CheckExtraPayment { extra }), "127.0.0.1", 0)
+            .expect("server")
+    }
+
+    #[tokio::test]
+    async fn check_incoming_payment_returns_backend_extra_json() {
+        let response = check_server(Some(serde_json::json!({ "hold_state": "HELD" })))
+            .check_incoming_payment(Request::new(check_incoming_request()))
+            .await
+            .expect("check succeeds")
+            .into_inner();
+
+        assert_eq!(
+            response.extra_json.as_deref(),
+            Some(r#"{"hold_state":"HELD"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn check_incoming_payment_without_extra_json_is_none() {
+        let response = check_server(None)
+            .check_incoming_payment(Request::new(check_incoming_request()))
+            .await
+            .expect("check succeeds")
+            .into_inner();
+
+        assert_eq!(response.extra_json, None);
     }
 }

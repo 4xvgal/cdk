@@ -279,6 +279,7 @@ message CheckIncomingPaymentRequest {
 
 message CheckIncomingPaymentResponse {
   repeated WaitIncomingPaymentResponse payments = 1;
+  optional string extra_json = 2;
 }
 
 message SettleIncomingRequest {

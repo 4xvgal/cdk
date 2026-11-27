@@ -5,6 +5,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/proto/lnrpc.proto");
     println!("cargo:rerun-if-changed=src/proto/routerrpc.proto");
+    println!("cargo:rerun-if-changed=src/proto/invoicesrpc.proto");
 
     // Tell cargo to tell rustc to allow missing docs in generated code
     println!("cargo:rustc-env=RUSTDOC_ARGS=--allow-missing-docs");
@@ -17,7 +18,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .type_attribute(".", "#[allow(missing_docs)]")
         .field_attribute(".", "#[allow(missing_docs)]")
         .compile_protos(
-            &["src/proto/lnrpc.proto", "src/proto/routerrpc.proto"],
+            &[
+                "src/proto/lnrpc.proto",
+                "src/proto/routerrpc.proto",
+                "src/proto/invoicesrpc.proto",
+            ],
             &["src/proto"],
         )?;
 

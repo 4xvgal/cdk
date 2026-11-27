@@ -33,11 +33,12 @@ use lnrpc::{FeeLimit, Hop, MppRecord};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
-mod client;
+pub mod client;
 pub mod error;
 
 mod proto;
-pub(crate) use proto::{lnrpc, routerrpc};
+#[doc(hidden)]
+pub use proto::{invoicesrpc, lnrpc, routerrpc};
 
 use crate::lnrpc::invoice::InvoiceState;
 

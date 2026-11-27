@@ -510,6 +510,27 @@ impl MintPayment for PaymentProcessorClient {
             .collect()
     }
 
+    async fn check_incoming_payment_extra(
+        &self,
+        payment_identifier: &cdk_common::payment::PaymentIdentifier,
+    ) -> Result<Option<serde_json::Value>, cdk_common::payment::Error> {
+        let mut inner = self.inner.clone();
+        let response = inner
+            .check_incoming_payment(Request::new(CheckIncomingPaymentRequest {
+                request_identifier: Some(payment_identifier.clone().into()),
+            }))
+            .await
+            .map_err(|err| {
+                tracing::error!("Could not check incoming payment: {}", err);
+                cdk_common::payment::Error::Custom(err.to_string())
+            })?;
+
+        Ok(response
+            .into_inner()
+            .extra_json
+            .and_then(|value| serde_json::from_str(&value).ok()))
+    }
+
     async fn check_outgoing_payment(
         &self,
         payment_identifier: &cdk_common::payment::PaymentIdentifier,

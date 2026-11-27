@@ -3,14 +3,29 @@
 use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
-#[cfg(any(feature = "cln", feature = "lnd", feature = "fake"))]
+#[cfg(any(
+    feature = "cln",
+    feature = "lnd",
+    feature = "fake",
+    feature = "lnd-hold"
+))]
 use std::sync::Arc;
 
-#[cfg(any(feature = "cln", feature = "lnd", feature = "fake"))]
+#[cfg(any(
+    feature = "cln",
+    feature = "lnd",
+    feature = "fake",
+    feature = "lnd-hold"
+))]
 use anyhow::bail;
 #[cfg(any(feature = "cln", feature = "lnd", feature = "fake"))]
 use cdk_common::common::FeeReserve;
-#[cfg(any(feature = "cln", feature = "lnd", feature = "fake"))]
+#[cfg(any(
+    feature = "cln",
+    feature = "lnd",
+    feature = "fake",
+    feature = "lnd-hold"
+))]
 use cdk_common::payment::{self, MintPayment};
 use cdk_common::Amount;
 #[cfg(feature = "fake")]
@@ -19,7 +34,12 @@ use cdk_fake_wallet::FakeWallet;
 use cdk_sqlite::MintSqliteDatabase;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-#[cfg(any(feature = "cln", feature = "lnd", feature = "fake"))]
+#[cfg(any(
+    feature = "cln",
+    feature = "lnd",
+    feature = "fake",
+    feature = "lnd-hold"
+))]
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
 
@@ -76,6 +96,17 @@ pub const ENV_LND_ADDRESS: &str = "CDK_PAYMENT_PROCESSOR_LND_ADDRESS";
 pub const ENV_LND_CERT_FILE: &str = "CDK_PAYMENT_PROCESSOR_LND_CERT_FILE";
 pub const ENV_LND_MACAROON_FILE: &str = "CDK_PAYMENT_PROCESSOR_LND_MACAROON_FILE";
 
+pub const ENV_LND_HOLD_MIN_FINAL_CLTV_EXPIRY_DELTA: &str =
+    "CDK_PAYMENT_PROCESSOR_LND_HOLD_MIN_FINAL_CLTV_EXPIRY_DELTA";
+pub const ENV_LND_HOLD_MAX_FINAL_CLTV_EXPIRY_DELTA: &str =
+    "CDK_PAYMENT_PROCESSOR_LND_HOLD_MAX_FINAL_CLTV_EXPIRY_DELTA";
+pub const ENV_LND_HOLD_SETTLE_MARGIN_BLOCKS: &str =
+    "CDK_PAYMENT_PROCESSOR_LND_HOLD_SETTLE_MARGIN_BLOCKS";
+pub const ENV_LND_HOLD_MAX_PENDING_QUOTES: &str =
+    "CDK_PAYMENT_PROCESSOR_LND_HOLD_MAX_PENDING_QUOTES";
+pub const ENV_LND_HOLD_INVOICE_EXPIRY_SECS: &str =
+    "CDK_PAYMENT_PROCESSOR_LND_HOLD_INVOICE_EXPIRY_SECS";
+
 #[derive(Parser)]
 #[command(name = "payment-processor")]
 #[command(about = "CDK Payment Processor", long_about = None)]
@@ -91,7 +122,12 @@ async fn main() -> anyhow::Result<()> {
     // Initialize logging based on CLI arguments
     init_logging(args.common.enable_logging, args.common.log_level);
 
-    #[cfg(any(feature = "cln", feature = "lnd", feature = "fake"))]
+    #[cfg(any(
+        feature = "cln",
+        feature = "lnd",
+        feature = "fake",
+        feature = "lnd-hold"
+    ))]
     {
         let backend: String = env::var(ENV_PAYMENT_BACKEND)?;
         let listen_addr: String = env::var(ENV_LISTEN_HOST)?;
@@ -156,6 +192,12 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await?,
                     )
+                }
+
+                #[cfg(feature = "lnd-hold")]
+                "LND_HOLD" => {
+                    let settings = lnd_hold_settings_from_env()?;
+                    Arc::new(cdk_lnd_hold::LndHold::new(settings).await?)
                 }
 
                 _ => {
@@ -257,4 +299,46 @@ impl Lnd {
 
         self
     }
+}
+
+#[cfg(feature = "lnd-hold")]
+fn env_parsed<T: std::str::FromStr>(name: &str) -> anyhow::Result<Option<T>>
+where
+    T::Err: std::fmt::Display,
+{
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|err| anyhow::anyhow!("Invalid value for {name}: {err}")),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(feature = "lnd-hold")]
+pub fn lnd_hold_settings_from_env() -> anyhow::Result<cdk_lnd_hold::Settings> {
+    let mut settings = cdk_lnd_hold::Settings {
+        address: env::var(ENV_LND_ADDRESS).unwrap_or_default(),
+        cert_file: env::var(ENV_LND_CERT_FILE)
+            .map(PathBuf::from)
+            .unwrap_or_default(),
+        macaroon_file: env::var(ENV_LND_MACAROON_FILE)
+            .map(PathBuf::from)
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+
+    settings.min_final_cltv_expiry_delta = env_parsed(ENV_LND_HOLD_MIN_FINAL_CLTV_EXPIRY_DELTA)?
+        .unwrap_or(settings.min_final_cltv_expiry_delta);
+    settings.max_final_cltv_expiry_delta = env_parsed(ENV_LND_HOLD_MAX_FINAL_CLTV_EXPIRY_DELTA)?
+        .unwrap_or(settings.max_final_cltv_expiry_delta);
+    settings.settle_margin_blocks =
+        env_parsed(ENV_LND_HOLD_SETTLE_MARGIN_BLOCKS)?.unwrap_or(settings.settle_margin_blocks);
+    settings.max_pending_quotes =
+        env_parsed(ENV_LND_HOLD_MAX_PENDING_QUOTES)?.unwrap_or(settings.max_pending_quotes);
+    settings.invoice_expiry_secs =
+        env_parsed(ENV_LND_HOLD_INVOICE_EXPIRY_SECS)?.unwrap_or(settings.invoice_expiry_secs);
+
+    Ok(settings)
 }

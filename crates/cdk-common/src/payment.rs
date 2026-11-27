@@ -512,6 +512,17 @@ pub trait MintPayment {
         payment_identifier: &PaymentIdentifier,
     ) -> Result<Vec<WaitPaymentResponse>, Self::Err>;
 
+    /// Extra payment-method-specific fields for an incoming payment check
+    ///
+    /// Custom backends report fields such as hold state here. The default
+    /// leaves the check response without extra data.
+    async fn check_incoming_payment_extra(
+        &self,
+        _payment_identifier: &PaymentIdentifier,
+    ) -> Result<Option<Value>, Error> {
+        Ok(None)
+    }
+
     /// Settle a held incoming payment with the preimage of its payment hash
     async fn settle_incoming_payment(
         &self,
@@ -905,6 +916,22 @@ where
         let result = self
             .inner
             .check_incoming_payment_status(payment_identifier)
+            .await;
+
+        metrics.record(result.is_ok());
+
+        result
+    }
+
+    async fn check_incoming_payment_extra(
+        &self,
+        payment_identifier: &PaymentIdentifier,
+    ) -> Result<Option<Value>, Error> {
+        let metrics = MintMetricGuard::new("check_incoming_payment_extra");
+
+        let result = self
+            .inner
+            .check_incoming_payment_extra(payment_identifier)
             .await;
 
         metrics.record(result.is_ok());

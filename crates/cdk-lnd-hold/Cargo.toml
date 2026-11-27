@@ -1,0 +1,24 @@
+[package]
+name = "cdk-lnd-hold"
+version.workspace = true
+edition.workspace = true
+authors = ["CDK Developers"]
+description = "CDK payment backend for LND hold invoices (NUT-XX bolt11_hold)"
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[dependencies]
+async-trait.workspace = true
+cdk-common = { workspace = true, features = ["mint"] }
+cdk-lnd = { workspace = true }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

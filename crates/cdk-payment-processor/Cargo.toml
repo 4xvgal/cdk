@@ -15,11 +15,12 @@ name = "cdk-payment-processor"
 path = "src/bin/payment_processor.rs"
 
 [features]
-default = ["cln", "fake", "lnd"]
+default = ["cln", "fake", "lnd", "lnd-hold"]
 bench = []
 cln = ["dep:cdk-cln", "dep:cdk-sqlite"]
 fake = ["dep:cdk-fake-wallet"]
 lnd = ["dep:cdk-lnd"]
+lnd-hold = ["dep:cdk-lnd-hold"]
 
 [dependencies]
 anyhow.workspace = true
@@ -29,6 +30,7 @@ cdk-common = { workspace = true, features = ["mint", "grpc"] }
 cdk-http-client = { workspace = true, features = ["bitreq"] }
 cdk-cln = { workspace = true, optional = true }
 cdk-lnd = { workspace = true, optional = true }
+cdk-lnd-hold = { workspace = true, optional = true }
 cdk-fake-wallet = { workspace = true, optional = true }
 cdk-sqlite = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive"] }

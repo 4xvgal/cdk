@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package invoicesrpc;
+
+option go_package = "github.com/lightningnetwork/lnd/lnrpc/invoicesrpc";
+
+service Invoices {
+    rpc AddHoldInvoice(AddHoldInvoiceRequest) returns (AddHoldInvoiceResp);
+}
+
+message AddHoldInvoiceRequest {
+    string memo = 1;
+    bytes hash = 2;
+    int64 value = 3;
+    int64 expiry = 5;
+    uint64 cltv_expiry = 7;
+}
+
+message AddHoldInvoiceResp {
+    string payment_request = 1;
+}

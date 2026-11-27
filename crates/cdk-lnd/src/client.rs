@@ -20,7 +20,7 @@ use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
 
-use crate::{lnrpc, routerrpc, Error};
+use crate::{invoicesrpc, lnrpc, routerrpc, Error};
 
 /// Custom certificate verifier for LND's self-signed certificates
 #[derive(Debug)]
@@ -121,7 +121,16 @@ impl ServerCertVerifier for LndCertVerifier {
     }
 }
 
+/// Router client used for outgoing payments
 pub type RouterClient = routerrpc::router_client::RouterClient<
+    InterceptedService<
+        HyperClient<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
+        MacaroonInterceptor,
+    >,
+>;
+
+/// Invoices client used for hold invoices
+pub type InvoicesClient = invoicesrpc::invoices_client::InvoicesClient<
     InterceptedService<
         HyperClient<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
         MacaroonInterceptor,
@@ -138,12 +147,26 @@ pub struct Client {
         >,
     >,
     router: RouterClient,
+    invoices: InvoicesClient,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LndClient").finish_non_exhaustive()
+    }
 }
 
 /// Supplies requests with macaroon
 #[derive(Clone)]
 pub struct MacaroonInterceptor {
     macaroon: String,
+}
+
+impl std::fmt::Debug for MacaroonInterceptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacaroonInterceptor")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Interceptor for MacaroonInterceptor {
@@ -162,6 +185,7 @@ async fn load_macaroon(path: impl AsRef<Path>) -> Result<String, Error> {
     Ok(hex::encode(macaroon))
 }
 
+/// Connect to an LND node over TLS with the macaroon attached to every call
 pub async fn connect<P: AsRef<Path>>(
     address: &str,
     cert_path: P,
@@ -204,12 +228,18 @@ pub async fn connect<P: AsRef<Path>>(
     // Create LND client
     let lightning =
         lnrpc::lightning_client::LightningClient::with_origin(service.clone(), uri.clone());
-    let router = RouterClient::with_origin(service, uri);
+    let router = RouterClient::with_origin(service.clone(), uri.clone());
+    let invoices = InvoicesClient::with_origin(service, uri);
 
-    Ok(Client { lightning, router })
+    Ok(Client {
+        lightning,
+        router,
+        invoices,
+    })
 }
 
 impl Client {
+    /// Lightning client
     pub fn lightning(
         &mut self,
     ) -> &mut lnrpc::lightning_client::LightningClient<
@@ -221,7 +251,13 @@ impl Client {
         &mut self.lightning
     }
 
+    /// Router client
     pub fn router(&mut self) -> &mut RouterClient {
         &mut self.router
+    }
+
+    /// Invoices client
+    pub fn invoices(&mut self) -> &mut InvoicesClient {
+        &mut self.invoices
     }
 }
