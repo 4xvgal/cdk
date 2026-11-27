@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::mint::{MeltPaymentRequest, MeltQuote};
 use crate::nuts::nut30::MeltQuoteOnchainFeeOption;
-use crate::nuts::{CurrencyUnit, MeltQuoteState, PublicKey};
+use crate::nuts::{CurrencyUnit, MeltQuoteState, MintQuoteState, PublicKey};
 use crate::{Amount, QuoteId};
 
 /// CDK Payment Error
@@ -45,6 +45,18 @@ pub enum Error {
     /// Invalid expiry
     #[error("Invalid expiry")]
     InvalidExpiry,
+    /// Preimage does not match the payment hash
+    #[error("Preimage does not match payment hash")]
+    PreimageMismatch,
+    /// Held incoming payment is not held
+    #[error("Quote is not held")]
+    HoldNotHeld,
+    /// Held incoming payment was cancelled
+    #[error("Quote is cancelled")]
+    HoldCancelled,
+    /// Held incoming payment passed its settle deadline
+    #[error("Settle deadline has passed")]
+    SettleDeadlinePassed,
     /// Payment backend error
     #[error(transparent)]
     Backend(Box<dyn std::error::Error + Send + Sync>),
@@ -500,6 +512,16 @@ pub trait MintPayment {
         payment_identifier: &PaymentIdentifier,
     ) -> Result<Vec<WaitPaymentResponse>, Self::Err>;
 
+    /// Settle a held incoming payment with the preimage of its payment hash
+    async fn settle_incoming_payment(
+        &self,
+        _method: &str,
+        _payment_identifier: &PaymentIdentifier,
+        _preimage: &str,
+    ) -> Result<SettleIncomingPaymentResponse, Self::Err> {
+        Err(Error::UnsupportedPaymentOption.into())
+    }
+
     /// Check the status of an outgoing payment
     ///
     /// The reported status must be conservative about finality. The mint
@@ -553,6 +575,17 @@ impl WaitPaymentResponse {
     pub fn unit(&self) -> &CurrencyUnit {
         self.payment_amount.unit()
     }
+}
+
+/// Settle incoming payment response
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettleIncomingPaymentResponse {
+    /// Id that is used to look up the payment from the payment backend
+    pub request_lookup_id: PaymentIdentifier,
+    /// Resulting state of the incoming payment
+    pub state: MintQuoteState,
+    /// Extra payment-method-specific fields
+    pub extra_json: Option<Value>,
 }
 
 /// Create incoming payment response
@@ -886,6 +919,26 @@ where
         let metrics = MintMetricGuard::new("check_outgoing_payment");
 
         let result = self.inner.check_outgoing_payment(payment_identifier).await;
+
+        let success = result.is_ok();
+
+        metrics.record(success);
+
+        result
+    }
+
+    async fn settle_incoming_payment(
+        &self,
+        method: &str,
+        payment_identifier: &PaymentIdentifier,
+        preimage: &str,
+    ) -> Result<SettleIncomingPaymentResponse, Self::Err> {
+        let metrics = MintMetricGuard::new("settle_incoming_payment");
+
+        let result = self
+            .inner
+            .settle_incoming_payment(method, payment_identifier, preimage)
+            .await;
 
         let success = result.is_ok();
 

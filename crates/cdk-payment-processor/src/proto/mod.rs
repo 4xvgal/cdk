@@ -4,7 +4,7 @@ use cdk_common::nuts::nut30::MeltQuoteOnchainFeeOption;
 use cdk_common::payment::{
     CreateIncomingPaymentResponse, MakePaymentResponse as CdkMakePaymentResponse,
     PaymentIdentifier as CdkPaymentIdentifier, PaymentQuoteResponse as CdkPaymentQuoteResponse,
-    WaitPaymentResponse,
+    SettleIncomingPaymentResponse, WaitPaymentResponse,
 };
 use cdk_common::util::hex;
 use cdk_common::{CurrencyUnit, MeltOptions as CdkMeltOptions};
@@ -14,6 +14,11 @@ mod server;
 
 pub use client::PaymentProcessorClient;
 pub use server::PaymentProcessorServer;
+
+pub(crate) const SETTLE_PREIMAGE_MISMATCH: &str = "Preimage does not match payment hash";
+pub(crate) const SETTLE_HOLD_NOT_HELD: &str = "Quote is not held";
+pub(crate) const SETTLE_HOLD_CANCELLED: &str = "Quote is cancelled";
+pub(crate) const SETTLE_DEADLINE_PASSED: &str = "Settle deadline has passed";
 
 tonic::include_proto!("cdk_payment_processor");
 
@@ -358,6 +363,47 @@ impl From<cdk_common::nuts::MintQuoteState> for QuoteState {
     }
 }
 
+impl TryFrom<QuoteState> for cdk_common::nuts::MintQuoteState {
+    type Error = crate::error::Error;
+
+    fn try_from(value: QuoteState) -> Result<Self, Self::Error> {
+        match value {
+            QuoteState::Unpaid => Ok(Self::Unpaid),
+            QuoteState::Paid => Ok(Self::Paid),
+            QuoteState::Issued => Ok(Self::Issued),
+            _ => Err(cdk_common::payment::Error::UnknownPaymentState.into()),
+        }
+    }
+}
+
+impl From<SettleIncomingPaymentResponse> for SettleIncomingResponse {
+    fn from(value: SettleIncomingPaymentResponse) -> Self {
+        Self {
+            request_identifier: Some(value.request_lookup_id.into()),
+            state: QuoteState::from(value.state).into(),
+            extra_json: value.extra_json.map(|value| value.to_string()),
+        }
+    }
+}
+
+impl TryFrom<SettleIncomingResponse> for SettleIncomingPaymentResponse {
+    type Error = crate::error::Error;
+
+    fn try_from(value: SettleIncomingResponse) -> Result<Self, Self::Error> {
+        let state = value.state().try_into()?;
+        Ok(Self {
+            request_lookup_id: value
+                .request_identifier
+                .ok_or(crate::error::Error::InvalidPaymentIdentifier)?
+                .try_into()?,
+            state,
+            extra_json: value
+                .extra_json
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok()),
+        })
+    }
+}
+
 impl From<WaitPaymentResponse> for WaitIncomingPaymentResponse {
     fn from(value: WaitPaymentResponse) -> Self {
         Self {
@@ -451,15 +497,46 @@ mod tests {
     use std::str::FromStr;
 
     use cdk_common::nuts::nut30::MeltQuoteOnchainFeeOption;
+    use cdk_common::nuts::MintQuoteState;
     use cdk_common::payment::{
         Event, MakePaymentResponse, OnchainSettings, PaymentIdentifier,
-        PaymentQuoteResponse as CdkPaymentQuoteResponse, WaitPaymentResponse,
+        PaymentQuoteResponse as CdkPaymentQuoteResponse, SettleIncomingPaymentResponse,
+        WaitPaymentResponse,
     };
     use cdk_common::{
         Amount, CurrencyUnit, MeltOptions as CdkMeltOptions, MeltQuoteState, QuoteId,
     };
 
-    use super::{PaymentEventResponse, PaymentQuoteResponse};
+    use super::{PaymentEventResponse, PaymentQuoteResponse, QuoteState, SettleIncomingResponse};
+
+    #[test]
+    fn settle_incoming_response_roundtrip() {
+        let response = SettleIncomingPaymentResponse {
+            request_lookup_id: PaymentIdentifier::PaymentHash([7u8; 32]),
+            state: MintQuoteState::Paid,
+            extra_json: Some(serde_json::json!({ "hold_state": "SETTLED" })),
+        };
+
+        let proto: SettleIncomingResponse = response.clone().into();
+        let roundtrip =
+            SettleIncomingPaymentResponse::try_from(proto).expect("valid proto response");
+
+        assert_eq!(roundtrip, response);
+    }
+
+    #[test]
+    fn settle_incoming_response_rejects_non_mint_state() {
+        let proto = SettleIncomingResponse {
+            request_identifier: Some(super::PaymentIdentifier {
+                r#type: super::PaymentIdentifierType::Label.into(),
+                value: Some(super::payment_identifier::Value::Id("lookup".to_string())),
+            }),
+            state: QuoteState::Pending.into(),
+            extra_json: None,
+        };
+
+        assert!(SettleIncomingPaymentResponse::try_from(proto).is_err());
+    }
 
     #[test]
     fn payment_quote_response_extra_json_roundtrip() {

@@ -586,6 +586,48 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
         Ok(Response::new(check_response.into()))
     }
 
+    async fn settle_incoming(
+        &self,
+        request: Request<SettleIncomingRequest>,
+    ) -> Result<Response<SettleIncomingResponse>, Status> {
+        let request = request.into_inner();
+
+        let payment_identifier = request
+            .request_identifier
+            .ok_or_else(|| Status::invalid_argument("Missing request identifier"))?
+            .try_into()
+            .map_err(|_| Status::invalid_argument("Invalid request identifier"))?;
+
+        let settle_response = self
+            .inner
+            .settle_incoming_payment(&request.method, &payment_identifier, &request.preimage)
+            .await
+            .map_err(|err| {
+                tracing::error!("Could not settle incoming payment: {}", err);
+
+                match err {
+                    cdk_common::payment::Error::PreimageMismatch => {
+                        Status::invalid_argument(SETTLE_PREIMAGE_MISMATCH)
+                    }
+                    cdk_common::payment::Error::HoldNotHeld => {
+                        Status::failed_precondition(SETTLE_HOLD_NOT_HELD)
+                    }
+                    cdk_common::payment::Error::HoldCancelled => {
+                        Status::failed_precondition(SETTLE_HOLD_CANCELLED)
+                    }
+                    cdk_common::payment::Error::SettleDeadlinePassed => {
+                        Status::failed_precondition(SETTLE_DEADLINE_PASSED)
+                    }
+                    cdk_common::payment::Error::UnsupportedPaymentOption => {
+                        Status::unimplemented("Settle incoming payment is not supported")
+                    }
+                    _ => Status::internal("Could not settle incoming payment"),
+                }
+            })?;
+
+        Ok(Response::new(settle_response.into()))
+    }
+
     type WaitPaymentEventStream = ResponseStream;
 
     #[allow(clippy::incompatible_msrv)]
@@ -732,6 +774,176 @@ mod tests {
         ) -> Result<payment::MakePaymentResponse, Self::Err> {
             unimplemented!()
         }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum SettleOutcome {
+        Mismatch,
+        NotHeld,
+        Cancelled,
+        DeadlinePassed,
+        Settled,
+    }
+
+    struct SettlePayment {
+        outcome: SettleOutcome,
+    }
+
+    #[async_trait]
+    impl MintPayment for SettlePayment {
+        type Err = payment::Error;
+
+        async fn get_settings(&self) -> Result<payment::SettingsResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn create_incoming_payment_request(
+            &self,
+            _options: IncomingPaymentOptions,
+        ) -> Result<payment::CreateIncomingPaymentResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn get_payment_quote(
+            &self,
+            _unit: &CurrencyUnit,
+            _options: payment::OutgoingPaymentOptions,
+        ) -> Result<payment::PaymentQuoteResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn make_payment(
+            &self,
+            _unit: &CurrencyUnit,
+            _options: payment::OutgoingPaymentOptions,
+        ) -> Result<payment::MakePaymentResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn wait_payment_event(
+            &self,
+        ) -> Result<Pin<Box<dyn Stream<Item = payment::Event> + Send>>, Self::Err> {
+            unimplemented!()
+        }
+
+        fn is_payment_event_stream_active(&self) -> bool {
+            unimplemented!()
+        }
+
+        fn cancel_payment_event_stream(&self) {
+            unimplemented!()
+        }
+
+        async fn check_incoming_payment_status(
+            &self,
+            _payment_identifier: &payment::PaymentIdentifier,
+        ) -> Result<Vec<payment::WaitPaymentResponse>, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn check_outgoing_payment(
+            &self,
+            _payment_identifier: &payment::PaymentIdentifier,
+        ) -> Result<payment::MakePaymentResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn settle_incoming_payment(
+            &self,
+            _method: &str,
+            payment_identifier: &payment::PaymentIdentifier,
+            _preimage: &str,
+        ) -> Result<payment::SettleIncomingPaymentResponse, Self::Err> {
+            match self.outcome {
+                SettleOutcome::Mismatch => Err(payment::Error::PreimageMismatch),
+                SettleOutcome::NotHeld => Err(payment::Error::HoldNotHeld),
+                SettleOutcome::Cancelled => Err(payment::Error::HoldCancelled),
+                SettleOutcome::DeadlinePassed => Err(payment::Error::SettleDeadlinePassed),
+                SettleOutcome::Settled => Ok(payment::SettleIncomingPaymentResponse {
+                    request_lookup_id: payment_identifier.clone(),
+                    state: cdk_common::nuts::MintQuoteState::Paid,
+                    extra_json: None,
+                }),
+            }
+        }
+    }
+
+    fn settle_request() -> SettleIncomingRequest {
+        SettleIncomingRequest {
+            request_identifier: Some(super::PaymentIdentifier {
+                r#type: super::PaymentIdentifierType::Label.into(),
+                value: Some(super::payment_identifier::Value::Id("lookup".to_string())),
+            }),
+            method: "bolt11_hold".to_string(),
+            preimage: "00".to_string(),
+        }
+    }
+
+    fn settle_server(outcome: SettleOutcome) -> PaymentProcessorServer {
+        PaymentProcessorServer::new(Arc::new(SettlePayment { outcome }), "127.0.0.1", 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn settle_incoming_maps_backend_errors_to_statuses() {
+        let cases = [
+            (
+                SettleOutcome::Mismatch,
+                tonic::Code::InvalidArgument,
+                SETTLE_PREIMAGE_MISMATCH,
+            ),
+            (
+                SettleOutcome::NotHeld,
+                tonic::Code::FailedPrecondition,
+                SETTLE_HOLD_NOT_HELD,
+            ),
+            (
+                SettleOutcome::Cancelled,
+                tonic::Code::FailedPrecondition,
+                SETTLE_HOLD_CANCELLED,
+            ),
+            (
+                SettleOutcome::DeadlinePassed,
+                tonic::Code::FailedPrecondition,
+                SETTLE_DEADLINE_PASSED,
+            ),
+        ];
+
+        for (outcome, code, message) in cases {
+            let status = settle_server(outcome)
+                .settle_incoming(Request::new(settle_request()))
+                .await
+                .expect_err("expected settle failure");
+            assert_eq!(status.code(), code, "{outcome:?}");
+            assert_eq!(status.message(), message, "{outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_incoming_returns_settled_state() {
+        let response = settle_server(SettleOutcome::Settled)
+            .settle_incoming(Request::new(settle_request()))
+            .await
+            .expect("settle should succeed")
+            .into_inner();
+
+        assert_eq!(response.state(), QuoteState::Paid);
+    }
+
+    #[tokio::test]
+    async fn settle_incoming_default_impl_is_unimplemented() {
+        let backend = Arc::new(TestPayment {
+            state: SubscriptionState::Idle,
+            started: Arc::new(Notify::new()),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        let server = PaymentProcessorServer::new(backend, "127.0.0.1", 0).unwrap();
+
+        let status = server
+            .settle_incoming(Request::new(settle_request()))
+            .await
+            .expect_err("expected unimplemented");
+
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
     }
 
     async fn assert_forwarding_stops(state: SubscriptionState, shutdown: bool) {

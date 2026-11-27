@@ -8,6 +8,7 @@ service CdkPaymentProcessor {
     rpc GetPaymentQuote(PaymentQuoteRequest) returns (PaymentQuoteResponse) {}
     rpc MakePayment(MakePaymentRequest) returns (MakePaymentResponse) {}
     rpc CheckIncomingPayment(CheckIncomingPaymentRequest) returns (CheckIncomingPaymentResponse) {}
+    rpc SettleIncoming(SettleIncomingRequest) returns (SettleIncomingResponse) {}
     rpc CheckOutgoingPayment(CheckOutgoingPaymentRequest) returns (MakePaymentResponse) {}
     rpc WaitPaymentEvent(EmptyRequest) returns (stream PaymentEventResponse) {}
 }
@@ -278,6 +279,18 @@ message CheckIncomingPaymentRequest {
 
 message CheckIncomingPaymentResponse {
   repeated WaitIncomingPaymentResponse payments = 1;
+}
+
+message SettleIncomingRequest {
+  PaymentIdentifier request_identifier = 1;
+  string method = 2;
+  string preimage = 3;
+}
+
+message SettleIncomingResponse {
+  PaymentIdentifier request_identifier = 1;
+  QuoteState state = 2;
+  optional string extra_json = 3;
 }
 
 message CheckOutgoingPaymentRequest {

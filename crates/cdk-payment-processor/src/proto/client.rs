@@ -9,21 +9,23 @@ use cdk_common::grpc::{VersionInterceptor, VERSION_HEADER};
 use cdk_common::payment::{
     CreateIncomingPaymentResponse, IncomingPaymentOptions as CdkIncomingPaymentOptions,
     MakePaymentResponse as CdkMakePaymentResponse, MintPayment,
-    PaymentQuoteResponse as CdkPaymentQuoteResponse, WaitPaymentResponse,
+    PaymentQuoteResponse as CdkPaymentQuoteResponse, SettleIncomingPaymentResponse,
+    WaitPaymentResponse,
 };
 use futures::{Stream, StreamExt};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
-use tonic::{async_trait, Request};
+use tonic::{async_trait, Code, Request};
 use tracing::instrument;
 
 use crate::proto::cdk_payment_processor_client::CdkPaymentProcessorClient;
 use crate::proto::{
     CheckIncomingPaymentRequest, CheckOutgoingPaymentRequest, CreatePaymentRequest, EmptyRequest,
     IncomingPaymentOptions, IntoProtoAmount, MakePaymentRequest, OutgoingPaymentRequestType,
-    PaymentQuoteRequest,
+    PaymentQuoteRequest, SettleIncomingRequest, SETTLE_DEADLINE_PASSED, SETTLE_HOLD_CANCELLED,
+    SETTLE_HOLD_NOT_HELD, SETTLE_PREIMAGE_MISMATCH,
 };
 
 /// Payment Processor
@@ -528,6 +530,46 @@ impl MintPayment for PaymentProcessorClient {
         Ok(check_outgoing
             .try_into()
             .map_err(|_| cdk_common::payment::Error::UnknownPaymentState)?)
+    }
+
+    async fn settle_incoming_payment(
+        &self,
+        method: &str,
+        payment_identifier: &cdk_common::payment::PaymentIdentifier,
+        preimage: &str,
+    ) -> Result<SettleIncomingPaymentResponse, Self::Err> {
+        let mut inner = self.inner.clone();
+        let response = inner
+            .settle_incoming(Request::new(SettleIncomingRequest {
+                request_identifier: Some(payment_identifier.clone().into()),
+                method: method.to_string(),
+                preimage: preimage.to_string(),
+            }))
+            .await
+            .map_err(|err| {
+                tracing::error!("Could not settle incoming payment: {}", err);
+
+                match (err.code(), err.message()) {
+                    (Code::Unimplemented, _) => {
+                        cdk_common::payment::Error::UnsupportedPaymentOption
+                    }
+                    (Code::InvalidArgument, SETTLE_PREIMAGE_MISMATCH) => {
+                        cdk_common::payment::Error::PreimageMismatch
+                    }
+                    (Code::FailedPrecondition, SETTLE_HOLD_NOT_HELD) => {
+                        cdk_common::payment::Error::HoldNotHeld
+                    }
+                    (Code::FailedPrecondition, SETTLE_HOLD_CANCELLED) => {
+                        cdk_common::payment::Error::HoldCancelled
+                    }
+                    (Code::FailedPrecondition, SETTLE_DEADLINE_PASSED) => {
+                        cdk_common::payment::Error::SettleDeadlinePassed
+                    }
+                    _ => cdk_common::payment::Error::Custom(err.to_string()),
+                }
+            })?;
+
+        response.into_inner().try_into().map_err(Self::Err::from)
     }
 }
 
