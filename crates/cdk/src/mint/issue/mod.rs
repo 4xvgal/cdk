@@ -350,7 +350,8 @@ impl Mint {
                     match err {
                         err @ (cdk_common::payment::Error::PaymentHashAlreadyUsed
                         | cdk_common::payment::Error::InvalidCltvDelta
-                        | cdk_common::payment::Error::InvalidLockupScript) => Error::Payment(err),
+                        | cdk_common::payment::Error::InvalidLockupScript
+                        | cdk_common::payment::Error::TooManyPendingQuotes) => Error::Payment(err),
                         _ => Error::InvalidPaymentRequest,
                     }
                 })?;

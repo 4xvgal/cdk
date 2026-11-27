@@ -206,7 +206,9 @@ impl TryFrom<MintMethodSettings> for cdk::nuts::nut04::MintMethodSettings {
             PaymentMethod::Bolt12 => s
                 .description
                 .map(|description| cdk::nuts::nut04::MintMethodOptions::Bolt12 { description }),
-            PaymentMethod::Custom { .. } => Some(cdk::nuts::nut04::MintMethodOptions::Custom {}),
+            PaymentMethod::Custom { .. } => Some(cdk::nuts::nut04::MintMethodOptions::Custom(
+                serde_json::json!({}),
+            )),
             _ => None,
         };
         Ok(Self {

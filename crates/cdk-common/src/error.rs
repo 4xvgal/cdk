@@ -729,6 +729,11 @@ mod tests {
                 ErrorCode::InvalidLockupScript,
                 20017,
             ),
+            (
+                crate::payment::Error::TooManyPendingQuotes,
+                ErrorCode::TooManyPendingQuotes,
+                20018,
+            ),
         ] {
             let response = ErrorResponse::from(Error::Payment(error));
 
@@ -740,12 +745,14 @@ mod tests {
         assert_eq!(ErrorCode::PaymentHashAlreadyUsed.to_code(), 20015);
         assert_eq!(ErrorCode::InvalidCltvDelta.to_code(), 20016);
         assert_eq!(ErrorCode::InvalidLockupScript.to_code(), 20017);
+        assert_eq!(ErrorCode::TooManyPendingQuotes.to_code(), 20018);
         assert_eq!(
             ErrorCode::from_code(20015),
             ErrorCode::PaymentHashAlreadyUsed
         );
         assert_eq!(ErrorCode::from_code(20016), ErrorCode::InvalidCltvDelta);
         assert_eq!(ErrorCode::from_code(20017), ErrorCode::InvalidLockupScript);
+        assert_eq!(ErrorCode::from_code(20018), ErrorCode::TooManyPendingQuotes);
         assert!(matches!(
             Error::from(ErrorResponse {
                 code: ErrorCode::PaymentHashAlreadyUsed,
@@ -759,6 +766,13 @@ mod tests {
                 detail: String::new(),
             }),
             Error::Payment(crate::payment::Error::InvalidCltvDelta)
+        ));
+        assert!(matches!(
+            Error::from(ErrorResponse {
+                code: ErrorCode::TooManyPendingQuotes,
+                detail: String::new(),
+            }),
+            Error::Payment(crate::payment::Error::TooManyPendingQuotes)
         ));
     }
 }
@@ -1244,6 +1258,11 @@ impl From<Error> for ErrorResponse {
                 detail: err.to_string(),
             },
             #[cfg(feature = "mint")]
+            Error::Payment(crate::payment::Error::TooManyPendingQuotes) => ErrorResponse {
+                code: ErrorCode::TooManyPendingQuotes,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "mint")]
             Error::Payment(payment_error) => {
                 tracing::error!(error = %payment_error, "Payment backend error");
                 ErrorResponse {
@@ -1412,6 +1431,10 @@ impl From<ErrorResponse> for Error {
             ErrorCode::InvalidLockupScript => {
                 Self::Payment(crate::payment::Error::InvalidLockupScript)
             }
+            #[cfg(feature = "mint")]
+            ErrorCode::TooManyPendingQuotes => {
+                Self::Payment(crate::payment::Error::TooManyPendingQuotes)
+            }
             // 30xxx - Clear auth errors
             ErrorCode::ClearAuthRequired => Self::ClearAuthRequired,
             ErrorCode::ClearAuthFailed => Self::ClearAuthFailed,
@@ -1520,6 +1543,8 @@ pub enum ErrorCode {
     InvalidCltvDelta,
     /// Lockup script invalid or not supported (20017)
     InvalidLockupScript,
+    /// Too many pending quotes (20018)
+    TooManyPendingQuotes,
 
     // 30xxx - Clear auth errors
     /// Endpoint requires clear auth (30001)
@@ -1589,6 +1614,7 @@ impl ErrorCode {
             20015 => Self::PaymentHashAlreadyUsed,
             20016 => Self::InvalidCltvDelta,
             20017 => Self::InvalidLockupScript,
+            20018 => Self::TooManyPendingQuotes,
             // 30xxx - Clear auth errors
             30001 => Self::ClearAuthRequired,
             30002 => Self::ClearAuthFailed,
@@ -1645,6 +1671,7 @@ impl ErrorCode {
             Self::PaymentHashAlreadyUsed => 20015,
             Self::InvalidCltvDelta => 20016,
             Self::InvalidLockupScript => 20017,
+            Self::TooManyPendingQuotes => 20018,
             // 30xxx - Clear auth errors
             Self::ClearAuthRequired => 30001,
             Self::ClearAuthFailed => 30002,

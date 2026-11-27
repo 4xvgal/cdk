@@ -9,6 +9,7 @@ use std::str::FromStr;
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 use super::nut00::{BlindSignature, BlindedMessage, CurrencyUnit, PaymentMethod};
@@ -127,6 +128,7 @@ impl Serialize for MintMethodSettings {
 
         let mut nested_description: Option<bool> = None;
         let mut onchain_confirmations: Option<u32> = None;
+        let mut custom_options: Option<Value> = None;
 
         match &self.options {
             // NUT-23 (bolt11) and NUT-25 (bolt12) advertise description support
@@ -139,6 +141,10 @@ impl Serialize for MintMethodSettings {
             Some(MintMethodOptions::Onchain { confirmations }) => {
                 onchain_confirmations = Some(*confirmations);
                 num_fields += 1; // for the "options" field
+            }
+            Some(MintMethodOptions::Custom(options)) => {
+                custom_options = Some(options.clone());
+                num_fields += 1;
             }
             _ => {}
         }
@@ -178,6 +184,10 @@ impl Serialize for MintMethodSettings {
             state.serialize_field("options", &DescriptionOptions { description })?;
         }
 
+        if let Some(options) = custom_options {
+            state.serialize_field("options", &options)?;
+        }
+
         state.end()
     }
 }
@@ -202,6 +212,7 @@ impl<'de> Visitor<'de> for MintMethodSettingsVisitor {
         let mut max_amount: Option<Amount> = None;
         let mut description: Option<bool> = None;
         let mut confirmations: Option<u32> = None;
+        let mut custom_options: Option<Value> = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -265,6 +276,10 @@ impl<'de> Visitor<'de> for MintMethodSettingsVisitor {
                     {
                         confirmations = Some(conf_from_options);
                     }
+
+                    if let Some(MintMethodOptions::Custom(custom_from_options)) = options {
+                        custom_options = Some(custom_from_options);
+                    }
                 }
                 _ => {
                     // Skip unknown fields
@@ -289,7 +304,7 @@ impl<'de> Visitor<'de> for MintMethodSettingsVisitor {
                 confirmations: conf,
             })
         } else {
-            None
+            custom_options.map(MintMethodOptions::Custom)
         };
 
         Ok(MintMethodSettings {
@@ -332,7 +347,7 @@ pub enum MintMethodOptions {
         confirmations: u32,
     },
     /// Custom Options
-    Custom {},
+    Custom(Value),
 }
 
 /// Mint Settings
@@ -891,6 +906,32 @@ mod tests {
         assert_eq!(parsed["method"], json!("bolt11"));
         assert!(parsed.get("description").is_none());
         assert_eq!(parsed["options"]["description"], json!(false));
+    }
+
+    #[test]
+    fn test_custom_method_options_round_trip() {
+        let settings = MintMethodSettings {
+            method: PaymentMethod::Custom("bolt11_hold".to_string()),
+            unit: CurrencyUnit::Sat,
+            method_name: None,
+            min_amount: Some(Amount::from(1)),
+            max_amount: Some(Amount::from(1000)),
+            options: Some(MintMethodOptions::Custom(json!({
+                "auto_settle_onchain": true,
+                "settle_margin_blocks": 22,
+            }))),
+        };
+
+        let serialized = to_string(&settings).unwrap();
+        let parsed: serde_json::Value = from_str(&serialized).unwrap();
+
+        assert_eq!(parsed["options"]["auto_settle_onchain"], json!(true));
+        assert_eq!(parsed["options"]["settle_margin_blocks"], json!(22));
+
+        let decoded: MintMethodSettings = from_str(&serialized).unwrap();
+
+        assert_eq!(decoded, settings);
+        assert_mint_method_settings_field_count(&settings);
     }
 
     #[test]

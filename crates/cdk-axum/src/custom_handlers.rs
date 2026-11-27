@@ -1353,6 +1353,7 @@ mod tests {
     }
 
     const HOLD_METHOD: &str = "bolt11_hold";
+    const HOLD_OPTIONS: &str = r#"{"min_final_cltv_expiry_delta":144,"max_final_cltv_expiry_delta":576,"settle_margin_blocks":22,"max_pending_quotes":100,"auto_settle_onchain":true}"#;
     const HOLD_AMOUNT_SAT: u64 = 21;
     const HOLD_SETTLE_DEADLINE: u64 = 870_420;
     const HOLD_PAYMENT_HASH: &str =
@@ -1374,6 +1375,7 @@ mod tests {
         Create,
         DuplicateHash,
         InvalidCltv,
+        TooManyPendingQuotes,
     }
 
     fn hold_lookup_id() -> PaymentIdentifier {
@@ -1436,7 +1438,7 @@ mod tests {
                 bolt11: None,
                 bolt12: None,
                 onchain: None,
-                custom: HashMap::from([(HOLD_METHOD.to_string(), "{}".to_string())]),
+                custom: HashMap::from([(HOLD_METHOD.to_string(), HOLD_OPTIONS.to_string())]),
             })
         }
 
@@ -1450,6 +1452,9 @@ mod tests {
                 }
                 (CreateBehavior::InvalidCltv, IncomingPaymentOptions::Custom(_)) => {
                     Err(cdk_payment::Error::InvalidCltvDelta)
+                }
+                (CreateBehavior::TooManyPendingQuotes, IncomingPaymentOptions::Custom(_)) => {
+                    Err(cdk_payment::Error::TooManyPendingQuotes)
                 }
                 (CreateBehavior::Create, IncomingPaymentOptions::Custom(_)) => {
                     Ok(CreateIncomingPaymentResponse {
@@ -1749,6 +1754,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mint_info_advertises_the_custom_method_options() {
+        let state = create_test_state_with_hold_backend(SettleBehavior::Settle).await;
+
+        let response = crate::router_handlers::get_mint_info(State(state))
+            .await
+            .expect("mint info");
+        let value = serde_json::to_value(response.0).expect("mint info json");
+        let method = value["nuts"]["4"]["methods"]
+            .as_array()
+            .expect("nut04 methods")
+            .iter()
+            .find(|method| method["method"] == HOLD_METHOD)
+            .expect("bolt11_hold in the mint info");
+
+        assert_eq!(method["options"]["min_final_cltv_expiry_delta"], 144);
+        assert_eq!(method["options"]["settle_margin_blocks"], 22);
+        assert_eq!(method["options"]["max_pending_quotes"], 100);
+        assert_eq!(method["options"]["auto_settle_onchain"], true);
+    }
+
+    #[tokio::test]
     async fn create_custom_routers_registers_settle_route() {
         let state = create_test_state_with_hold_backend(SettleBehavior::Settle).await;
 
@@ -1912,6 +1938,7 @@ mod tests {
         for (create, expected_code) in [
             (CreateBehavior::DuplicateHash, 20015),
             (CreateBehavior::InvalidCltv, 20016),
+            (CreateBehavior::TooManyPendingQuotes, 20018),
         ] {
             let state = create_hold_state_with_create(create).await;
 

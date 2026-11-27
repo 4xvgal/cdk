@@ -172,6 +172,25 @@ pub fn lockup_stop(record: HoldRecord) -> Option<bool> {
     }
 }
 
+/// Outcome of reserving a pending quote slot
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reserve {
+    /// The slot is reserved and the payment hash is tracked as unpaid
+    Reserved,
+    /// The tracker already holds a record for the payment hash
+    AlreadyTracked,
+    /// The tracker holds the maximum number of pending quotes
+    Full,
+}
+
+/// `true` when `block_height` is past the settle deadline of `record`
+pub fn past_deadline(record: HoldRecord, block_height: Option<u32>) -> bool {
+    match (record.settle_deadline, block_height) {
+        (Some(deadline), Some(height)) => height > deadline,
+        _ => false,
+    }
+}
+
 /// Effect of one settle attempt from a preimage revealed on chain
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockupAttempt {
@@ -335,6 +354,54 @@ impl HoldTracker {
             .filter(|(_, record)| record.state == HoldState::Held)
             .map(|(payment_hash, record)| (*payment_hash, *record))
             .collect()
+    }
+
+    /// Number of quotes that are neither settled nor cancelled
+    pub fn pending_count(&self) -> usize {
+        self.lock()
+            .values()
+            .filter(|record| !record.state.is_terminal())
+            .count()
+    }
+
+    /// Reserve a pending slot for `payment_hash`, tracking it as unpaid
+    ///
+    /// The count and the insert happen under one lock, so concurrent creates
+    /// cannot pass the limit together.
+    pub fn reserve(&self, payment_hash: &[u8; 32], max_pending_quotes: u32) -> Reserve {
+        let mut records = self.lock();
+
+        if records.contains_key(payment_hash) {
+            return Reserve::AlreadyTracked;
+        }
+
+        let pending = records
+            .values()
+            .filter(|record| !record.state.is_terminal())
+            .count();
+
+        if pending >= max_pending_quotes as usize {
+            return Reserve::Full;
+        }
+
+        records.insert(
+            *payment_hash,
+            HoldRecord::from_status(HoldStatus::unpaid(), self.settle_margin_blocks),
+        );
+
+        Reserve::Reserved
+    }
+
+    /// Drop a reservation whose quote could not be created
+    pub fn release(&self, payment_hash: &[u8; 32]) {
+        let mut records = self.lock();
+
+        if records
+            .get(payment_hash)
+            .is_some_and(|record| record.state == HoldState::Unpaid)
+        {
+            records.remove(payment_hash);
+        }
     }
 
     /// `true` when `payment_hash` already has a record
@@ -812,6 +879,62 @@ mod tests {
         assert!(!should_cancel(held, true, 989));
         assert!(!should_cancel(held, true, u32::MAX));
         assert!(!should_cancel(held, false, 988));
+    }
+
+    #[test]
+    fn reserving_a_slot_stops_at_the_limit_and_release_frees_it() {
+        let tracker = HoldTracker::new(12);
+
+        assert_eq!(tracker.reserve(&[1; 32], 1), Reserve::Reserved);
+        assert_eq!(tracker.pending_count(), 1);
+        assert_eq!(tracker.reserve(&[2; 32], 1), Reserve::Full);
+        assert_eq!(tracker.reserve(&[1; 32], 1), Reserve::AlreadyTracked);
+        assert_eq!(tracker.pending_count(), 1);
+
+        tracker.release(&[1; 32]);
+
+        assert_eq!(tracker.pending_count(), 0);
+        assert!(!tracker.is_tracked(&[1; 32]));
+        assert_eq!(tracker.reserve(&[2; 32], 1), Reserve::Reserved);
+        assert_eq!(tracker.pending_count(), 1);
+    }
+
+    #[test]
+    fn release_keeps_a_quote_that_is_no_longer_unpaid() {
+        let tracker = HoldTracker::new(12);
+
+        assert_eq!(tracker.reserve(&[1; 32], 1), Reserve::Reserved);
+        tracker.observe(&[1; 32], status(HoldState::Held, Some(1_000)));
+        tracker.release(&[1; 32]);
+
+        assert_eq!(
+            tracker.get(&[1; 32]).map(|record| record.state),
+            Some(HoldState::Held)
+        );
+    }
+
+    #[test]
+    fn past_deadline_needs_a_known_deadline_and_height() {
+        let held = HoldRecord::from_status(status(HoldState::Held, Some(1_012)), 12);
+        assert!(past_deadline(held, Some(1_001)));
+        assert!(!past_deadline(held, Some(1_000)));
+        assert!(!past_deadline(held, None));
+
+        let unpaid = HoldRecord::from_status(HoldStatus::unpaid(), 12);
+        assert!(!past_deadline(unpaid, Some(u32::MAX)));
+    }
+
+    #[test]
+    fn tracker_counts_pending_quotes() {
+        let tracker = HoldTracker::new(12);
+        assert_eq!(tracker.pending_count(), 0);
+
+        tracker.observe(&[1; 32], status(HoldState::Unpaid, None));
+        tracker.observe(&[2; 32], status(HoldState::Held, Some(1_000)));
+        tracker.observe(&[3; 32], status(HoldState::Settled, Some(1_000)));
+        tracker.observe(&[4; 32], status(HoldState::Cancelled, Some(1_000)));
+
+        assert_eq!(tracker.pending_count(), 2);
     }
 
     #[test]

@@ -22,8 +22,8 @@ use cdk_common::{Amount, Bolt11Invoice, CurrencyUnit, MintQuoteState};
 use cdk_lnd::{chainrpc, client, invoicesrpc, lnrpc};
 use futures::{Stream, StreamExt};
 use hold::{
-    follow_action, lockup_attempt, lockup_stop, settle_decision, FollowAction, HoldRecord,
-    HoldState, HoldStatus, HoldTracker, LockupAttempt, SettleDecision,
+    follow_action, lockup_attempt, lockup_stop, past_deadline, settle_decision, FollowAction,
+    HoldRecord, HoldState, HoldStatus, HoldTracker, LockupAttempt, Reserve, SettleDecision,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -344,6 +344,7 @@ impl LndHold {
             events,
             watched: Arc::new(Mutex::new(HashSet::new())),
             lockups: Arc::new(Mutex::new(HashSet::new())),
+            height: Arc::new(Mutex::new(None)),
         };
 
         tokio::spawn(poll_block_height(watcher.clone()));
@@ -356,6 +357,57 @@ impl LndHold {
             watcher,
             event_stream_active: Arc::new(AtomicBool::new(false)),
             event_cancel: CancellationToken::new(),
+        })
+    }
+
+    async fn create_reserved_quote(
+        &self,
+        request: &HoldInvoiceRequest,
+        description: String,
+    ) -> Result<CreateIncomingPaymentResponse, payment::Error> {
+        let add_request = add_hold_invoice_request(request, description, &self.settings);
+
+        let mut client = self.watcher.client.clone();
+        let response = client
+            .invoices()
+            .add_hold_invoice(Request::new(add_request))
+            .await
+            .map_err(|status| {
+                if is_hash_already_used(&status) {
+                    return payment::Error::PaymentHashAlreadyUsed;
+                }
+
+                invalid(&format!("LND AddHoldInvoice failed: {status}"))
+            })?
+            .into_inner();
+
+        let bolt11 = Bolt11Invoice::from_str(&response.payment_request)?;
+
+        if bolt11.payment_hash().as_byte_array() != &request.payment_hash {
+            return Err(payment::Error::InvalidHash);
+        }
+
+        self.watcher.ensure_watching(&request.payment_hash);
+
+        if let Some(script) = &request.lockup_script {
+            let height_hint = self.watcher.block_height().await?;
+            self.watcher
+                .store
+                .watch_lockup(&request.payment_hash, script, height_hint)?;
+            self.watcher.ensure_lockup_watch(&request.payment_hash);
+
+            tracing::info!(
+                payment_hash = %hex::encode(request.payment_hash),
+                height_hint,
+                "watching the on-chain lockup of the quote",
+            );
+        }
+
+        Ok(CreateIncomingPaymentResponse {
+            request_lookup_id: PaymentIdentifier::PaymentHash(request.payment_hash),
+            expiry: bolt11.expires_at().map(|time| time.as_secs()),
+            request: bolt11.to_string(),
+            extra_json: Some(created_extra(request, self.settings.settle_margin_blocks)),
         })
     }
 }
@@ -377,6 +429,7 @@ struct Watcher {
     events: broadcast::Sender<WaitPaymentResponse>,
     watched: Arc<Mutex<HashSet<[u8; 32]>>>,
     lockups: Arc<Mutex<HashSet<[u8; 32]>>>,
+    height: Arc<Mutex<Option<u32>>>,
 }
 
 impl Watcher {
@@ -416,12 +469,19 @@ impl Watcher {
     async fn block_height(&self) -> Result<u32, payment::Error> {
         let mut client = self.client.clone();
 
-        client
+        let height = client
             .lightning()
             .get_info(Request::new(lnrpc::GetInfoRequest {}))
             .await
             .map(|response| response.into_inner().block_height)
-            .map_err(|status| invalid(&format!("LND GetInfo failed: {status}")))
+            .map_err(|status| invalid(&format!("LND GetInfo failed: {status}")))?;
+
+        *self.height.lock().unwrap_or_else(PoisonError::into_inner) = Some(height);
+        Ok(height)
+    }
+
+    fn tip_height(&self) -> Option<u32> {
+        *self.height.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     async fn settle_invoice(&self, preimage: &[u8; 32]) -> Result<(), tonic::Status> {
@@ -480,6 +540,13 @@ impl Watcher {
         tokio::spawn(follow_lockup(self.clone(), *payment_hash));
     }
 
+    fn lockups_count(&self) -> usize {
+        self.lockups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
     fn stop_lockup_watch(&self, payment_hash: &[u8; 32]) {
         self.lockups
             .lock()
@@ -519,10 +586,12 @@ impl Watcher {
     }
 
     async fn past_deadline(&self, record: HoldRecord) -> bool {
-        match (record.settle_deadline, self.block_height().await) {
-            (Some(deadline), Ok(height)) => height > deadline,
-            _ => false,
-        }
+        let height = match self.tip_height() {
+            Some(height) => Some(height),
+            None => self.block_height().await.ok(),
+        };
+
+        past_deadline(record, height)
     }
 
     async fn settle_lockup(
@@ -766,7 +835,7 @@ async fn poll_block_height(watcher: Watcher) {
 
         let held = watcher.tracker.held();
 
-        if held.is_empty() {
+        if held.is_empty() && watcher.lockups_count() == 0 {
             continue;
         }
 
@@ -1063,57 +1132,33 @@ impl MintPayment for LndHold {
             &self.settings,
         )?;
 
-        let add_request = add_hold_invoice_request(
-            &request,
-            options.description.unwrap_or_default(),
-            &self.settings,
-        );
-
-        let mut client = self.watcher.client.clone();
-        let response = client
-            .invoices()
-            .add_hold_invoice(Request::new(add_request))
-            .await
-            .map_err(|status| {
-                if is_hash_already_used(&status) {
-                    return payment::Error::PaymentHashAlreadyUsed;
-                }
-
-                invalid(&format!("LND AddHoldInvoice failed: {status}"))
-            })?
-            .into_inner();
-
-        let bolt11 = Bolt11Invoice::from_str(&response.payment_request)?;
-
-        if bolt11.payment_hash().as_byte_array() != &request.payment_hash {
-            return Err(payment::Error::InvalidHash);
-        }
-
-        self.watcher
+        match self
+            .watcher
             .tracker
-            .observe(&request.payment_hash, HoldStatus::unpaid());
-        self.watcher.ensure_watching(&request.payment_hash);
+            .reserve(&request.payment_hash, self.settings.max_pending_quotes)
+        {
+            Reserve::Reserved => {}
+            Reserve::AlreadyTracked => return Err(payment::Error::PaymentHashAlreadyUsed),
+            Reserve::Full => {
+                tracing::warn!(
+                    payment_hash = %hex::encode(request.payment_hash),
+                    max_pending_quotes = self.settings.max_pending_quotes,
+                    "rejecting the quote: the processor holds the maximum number of pending quotes",
+                );
 
-        if let Some(script) = &request.lockup_script {
-            let height_hint = self.watcher.block_height().await?;
-            self.watcher
-                .store
-                .watch_lockup(&request.payment_hash, script, height_hint)?;
-            self.watcher.ensure_lockup_watch(&request.payment_hash);
-
-            tracing::info!(
-                payment_hash = %hex::encode(request.payment_hash),
-                height_hint,
-                "watching the on-chain lockup of the quote",
-            );
+                return Err(payment::Error::TooManyPendingQuotes);
+            }
         }
 
-        Ok(CreateIncomingPaymentResponse {
-            request_lookup_id: PaymentIdentifier::PaymentHash(request.payment_hash),
-            expiry: bolt11.expires_at().map(|time| time.as_secs()),
-            request: bolt11.to_string(),
-            extra_json: Some(created_extra(&request, self.settings.settle_margin_blocks)),
-        })
+        let created = self
+            .create_reserved_quote(&request, options.description.unwrap_or_default())
+            .await;
+
+        if created.is_err() {
+            self.watcher.tracker.release(&request.payment_hash);
+        }
+
+        created
     }
 
     async fn get_payment_quote(

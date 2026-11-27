@@ -508,7 +508,7 @@ impl MintBuilder {
             // Handle custom methods
             PaymentMethod::Custom(_) => {
                 // Check if this custom method is supported by the payment processor
-                if settings.custom.contains_key(method.as_str()) {
+                if let Some(custom_settings) = settings.custom.get(method.as_str()) {
                     // Add to NUT04 (mint)
                     let mint_method_settings = MintMethodSettings {
                         method: method.clone(),
@@ -516,7 +516,9 @@ impl MintBuilder {
                         method_name: None,
                         min_amount: Some(limits.mint_min),
                         max_amount: Some(limits.mint_max),
-                        options: Some(MintMethodOptions::Custom {}),
+                        options: Some(MintMethodOptions::Custom(custom_method_options(
+                            custom_settings,
+                        ))),
                     };
                     self.mint_info.nuts.nut04.methods.push(mint_method_settings);
                     self.mint_info.nuts.nut04.disabled = false;
@@ -794,6 +796,18 @@ impl MintMeltLimits {
             mint_max: max.into(),
             melt_min: min.into(),
             melt_max: max.into(),
+        }
+    }
+}
+
+fn custom_method_options(settings: &str) -> serde_json::Value {
+    match serde_json::from_str(settings) {
+        Ok(serde_json::Value::Object(options)) => serde_json::Value::Object(options),
+        _ => {
+            tracing::warn!(
+                "a custom payment method setting is not a JSON object; advertising no options"
+            );
+            serde_json::Value::Object(Default::default())
         }
     }
 }
@@ -1337,7 +1351,10 @@ mod tests {
             .unwrap();
 
         let mut custom_methods = HashMap::new();
-        custom_methods.insert("paypal".to_string(), "{}".to_string());
+        custom_methods.insert(
+            "paypal".to_string(),
+            r#"{"auto_settle_onchain":true,"max_pending_quotes":7}"#.to_string(),
+        );
 
         let settings = SettingsResponse {
             unit: "usd".to_string(),
@@ -1367,10 +1384,23 @@ mod tests {
         assert_eq!(mint_method.unit, unit);
         assert_eq!(mint_method.min_amount, Some(limits.mint_min));
         assert_eq!(mint_method.max_amount, Some(limits.mint_max));
-        assert!(matches!(
+        assert_eq!(
             mint_method.options,
-            Some(MintMethodOptions::Custom {})
-        ));
+            Some(MintMethodOptions::Custom(serde_json::json!({
+                "auto_settle_onchain": true,
+                "max_pending_quotes": 7,
+            })))
+        );
+
+        let advertised = serde_json::to_value(&mint_info).unwrap();
+        let bolt11_hold = advertised["nuts"]["4"]["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|method| method["method"] == "paypal")
+            .expect("paypal method in the mint info");
+        assert_eq!(bolt11_hold["options"]["auto_settle_onchain"], true);
+        assert_eq!(bolt11_hold["options"]["max_pending_quotes"], 7);
 
         // Check NUT05 (melt) settings
         assert!(!mint_info.nuts.nut05.disabled);

@@ -310,6 +310,9 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
                     cdk_common::payment::Error::InvalidLockupScript => {
                         Status::invalid_argument(CREATE_INVALID_LOCKUP_SCRIPT)
                     }
+                    cdk_common::payment::Error::TooManyPendingQuotes => {
+                        Status::resource_exhausted(CREATE_TOO_MANY_PENDING_QUOTES)
+                    }
                     _ => Status::internal("Could not create invoice"),
                 }
             })?;

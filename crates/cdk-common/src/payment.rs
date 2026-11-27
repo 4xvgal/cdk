@@ -66,6 +66,9 @@ pub enum Error {
     /// On-chain lockup script is invalid or not supported
     #[error("Lockup script is invalid or not supported")]
     InvalidLockupScript,
+    /// The mint holds the maximum number of pending quotes
+    #[error("Too many pending quotes")]
+    TooManyPendingQuotes,
     /// Payment backend error
     #[error(transparent)]
     Backend(Box<dyn std::error::Error + Send + Sync>),
