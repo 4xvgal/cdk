@@ -307,6 +307,9 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
                     cdk_common::payment::Error::InvalidCltvDelta => {
                         Status::invalid_argument(CREATE_INVALID_CLTV_DELTA)
                     }
+                    cdk_common::payment::Error::InvalidLockupScript => {
+                        Status::invalid_argument(CREATE_INVALID_LOCKUP_SCRIPT)
+                    }
                     _ => Status::internal("Could not create invoice"),
                 }
             })?;

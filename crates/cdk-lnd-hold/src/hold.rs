@@ -160,6 +160,54 @@ pub fn should_cancel(record: HoldRecord, preimage_persisted: bool, block_height:
     !preimage_persisted && record.should_cancel(block_height)
 }
 
+/// Whether a hold record ends the watch of an on-chain lockup
+///
+/// `true` when the quote is resolved, `false` while an unpaid quote is still
+/// watched, and `None` when only the settle deadline can end the watch.
+pub fn lockup_stop(record: HoldRecord) -> Option<bool> {
+    match record.state {
+        HoldState::Settled | HoldState::Cancelled => Some(true),
+        HoldState::Unpaid => Some(false),
+        HoldState::Held => None,
+    }
+}
+
+/// Effect of one settle attempt from a preimage revealed on chain
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockupAttempt {
+    /// Settle the held HTLCs with the preimage
+    Settle,
+    /// The quote is resolved and needs no further watching
+    Resolved,
+    /// The HTLCs are not held yet; try again within this attempt
+    Retry,
+    /// Stop this attempt, but keep the watch so a later event retries
+    Defer,
+}
+
+/// Decide one settle attempt from a revealed preimage
+///
+/// `rounds_left` counts the remaining attempts of this pass. A quote that is
+/// not held yet is deferred rather than dropped, so the watch stays alive for
+/// an HTLC that arrives after the lockup was spent.
+pub fn lockup_attempt(
+    decision: Result<SettleDecision, payment::Error>,
+    rounds_left: u32,
+) -> LockupAttempt {
+    match decision {
+        Ok(SettleDecision::Settle) => LockupAttempt::Settle,
+        Ok(SettleDecision::AlreadySettled) => LockupAttempt::Resolved,
+        Err(payment::Error::HoldNotHeld | payment::Error::UnknownPaymentState) => {
+            if rounds_left > 0 {
+                LockupAttempt::Retry
+            } else {
+                LockupAttempt::Defer
+            }
+        }
+        Err(_) => LockupAttempt::Resolved,
+    }
+}
+
 /// Outcome of a settle request
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettleDecision {
@@ -698,6 +746,62 @@ mod tests {
             settle_decision(settled, true, Some(u32::MAX)).ok(),
             Some(SettleDecision::AlreadySettled)
         );
+    }
+
+    #[test]
+    fn lockup_stop_resolves_unpaid_and_finished_quotes() {
+        for (state, expected) in [
+            (HoldState::Unpaid, Some(false)),
+            (HoldState::Held, None),
+            (HoldState::Settled, Some(true)),
+            (HoldState::Cancelled, Some(true)),
+        ] {
+            let record = HoldRecord::from_status(status(state, Some(1_000)), 12);
+            assert_eq!(lockup_stop(record), expected, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn lockup_attempt_settles_a_held_record() {
+        let held = HoldRecord::from_status(status(HoldState::Held, Some(1_012)), 12);
+
+        assert_eq!(
+            lockup_attempt(settle_decision(held, false, Some(1_000)), 0),
+            LockupAttempt::Settle
+        );
+    }
+
+    #[test]
+    fn lockup_attempt_defers_an_invoice_that_is_not_held() {
+        let unpaid = HoldRecord::from_status(HoldStatus::unpaid(), 12);
+        let held = HoldRecord::from_status(status(HoldState::Held, Some(1_012)), 12);
+
+        for (record, height) in [(unpaid, Some(1_000)), (held, None)] {
+            assert_eq!(
+                lockup_attempt(settle_decision(record, false, height), 1),
+                LockupAttempt::Retry
+            );
+            assert_eq!(
+                lockup_attempt(settle_decision(record, false, height), 0),
+                LockupAttempt::Defer,
+                "giving up an attempt must keep the watch"
+            );
+        }
+    }
+
+    #[test]
+    fn lockup_attempt_resolves_settled_cancelled_and_late_quotes() {
+        let held = HoldRecord::from_status(status(HoldState::Held, Some(1_012)), 12);
+        let settled = HoldRecord::from_status(status(HoldState::Settled, Some(1_012)), 12);
+        let cancelled = HoldRecord::from_status(status(HoldState::Cancelled, Some(1_012)), 12);
+
+        for decision in [
+            settle_decision(settled, false, Some(1_000)),
+            settle_decision(cancelled, false, Some(1_000)),
+            settle_decision(held, false, Some(1_001)),
+        ] {
+            assert_eq!(lockup_attempt(decision, 3), LockupAttempt::Resolved);
+        }
     }
 
     #[test]

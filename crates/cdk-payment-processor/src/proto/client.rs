@@ -25,8 +25,8 @@ use crate::proto::{
     CheckIncomingPaymentRequest, CheckOutgoingPaymentRequest, CreatePaymentRequest, EmptyRequest,
     IncomingPaymentOptions, IntoProtoAmount, MakePaymentRequest, OutgoingPaymentRequestType,
     PaymentQuoteRequest, SettleIncomingRequest, CREATE_INVALID_CLTV_DELTA,
-    CREATE_PAYMENT_HASH_ALREADY_USED, SETTLE_DEADLINE_PASSED, SETTLE_HOLD_CANCELLED,
-    SETTLE_HOLD_NOT_HELD, SETTLE_PREIMAGE_MISMATCH,
+    CREATE_INVALID_LOCKUP_SCRIPT, CREATE_PAYMENT_HASH_ALREADY_USED, SETTLE_DEADLINE_PASSED,
+    SETTLE_HOLD_CANCELLED, SETTLE_HOLD_NOT_HELD, SETTLE_PREIMAGE_MISMATCH,
 };
 
 /// Payment Processor
@@ -237,6 +237,9 @@ impl MintPayment for PaymentProcessorClient {
                     }
                     (Code::InvalidArgument, CREATE_INVALID_CLTV_DELTA) => {
                         cdk_common::payment::Error::InvalidCltvDelta
+                    }
+                    (Code::InvalidArgument, CREATE_INVALID_LOCKUP_SCRIPT) => {
+                        cdk_common::payment::Error::InvalidLockupScript
                     }
                     _ => cdk_common::payment::Error::Custom(err.to_string()),
                 }

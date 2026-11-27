@@ -18,3 +18,10 @@ pub mod routerrpc {
 pub mod invoicesrpc {
     tonic::include_proto!("invoicesrpc");
 }
+
+#[allow(clippy::all, clippy::pedantic, clippy::restriction, clippy::nursery)]
+#[allow(dead_code)]
+/// Generated LND chain notifier gRPC bindings
+pub mod chainrpc {
+    tonic::include_proto!("chainrpc");
+}

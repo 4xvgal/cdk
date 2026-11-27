@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use cdk_common::bitcoin::consensus::deserialize;
 use cdk_common::bitcoin::hashes::{sha256, Hash};
+use cdk_common::bitcoin::Transaction;
 use cdk_common::payment::{
     self, CreateIncomingPaymentResponse, Event, IncomingPaymentOptions, MakePaymentResponse,
     MintPayment, OutgoingPaymentOptions, PaymentIdentifier, PaymentQuoteResponse, SettingsResponse,
@@ -17,11 +19,11 @@ use cdk_common::payment::{
 };
 use cdk_common::util::hex;
 use cdk_common::{Amount, Bolt11Invoice, CurrencyUnit, MintQuoteState};
-use cdk_lnd::{client, invoicesrpc, lnrpc};
+use cdk_lnd::{chainrpc, client, invoicesrpc, lnrpc};
 use futures::{Stream, StreamExt};
 use hold::{
-    follow_action, settle_decision, FollowAction, HoldRecord, HoldState, HoldStatus, HoldTracker,
-    SettleDecision,
+    follow_action, lockup_attempt, lockup_stop, settle_decision, FollowAction, HoldRecord,
+    HoldState, HoldStatus, HoldTracker, LockupAttempt, SettleDecision,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -38,6 +40,12 @@ use tracing::instrument;
 /// module has no I/O.
 pub mod hold;
 
+/// On-chain lockup scripts a `bolt11_hold` quote can be settled from
+///
+/// The mint watches the lockup of the quote and settles the held HTLCs once the
+/// preimage is revealed on-chain. This module has no I/O.
+pub mod lockup;
+
 /// SQLite store of the preimages and hold states of this processor
 pub mod store;
 
@@ -46,6 +54,7 @@ const RECOVERY_PAGE_SIZE: u64 = 1_000;
 const BLOCK_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SUBSCRIPTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const SETTLE_RETRY_DELAY: Duration = Duration::from_secs(5);
+const LOCKUP_SETTLE_ROUNDS: u32 = 12;
 
 /// Custom payment method served by this backend
 pub const METHOD: &str = "bolt11_hold";
@@ -75,6 +84,9 @@ pub struct Settings {
     pub invoice_expiry_secs: i32,
     /// SQLite file holding the persisted preimages and hold states
     pub settle_db_path: PathBuf,
+    /// Watch the on-chain lockup of a quote and settle it from the revealed
+    /// preimage
+    pub auto_settle_onchain: bool,
 }
 
 impl Default for Settings {
@@ -90,6 +102,7 @@ impl Default for Settings {
             max_pending_quotes: 100,
             invoice_expiry_secs: 3600,
             settle_db_path: PathBuf::from("cdk-lnd-hold-settle.sqlite"),
+            auto_settle_onchain: true,
         }
     }
 }
@@ -102,6 +115,7 @@ impl Settings {
             "max_final_cltv_expiry_delta": self.max_final_cltv_expiry_delta,
             "settle_margin_blocks": self.settle_margin_blocks,
             "max_pending_quotes": self.max_pending_quotes,
+            "auto_settle_onchain": self.auto_settle_onchain,
         })
     }
 }
@@ -111,6 +125,7 @@ struct HoldInvoiceRequest {
     payment_hash: [u8; 32],
     amount_sat: u64,
     cltv_expiry_delta: u32,
+    lockup_script: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +133,13 @@ struct ExtraFields {
     payment_hash: Option<String>,
     #[serde(default)]
     min_final_cltv_expiry_delta: Option<u32>,
+    #[serde(default)]
+    lockup: Option<LockupFields>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LockupFields {
+    script: String,
 }
 
 fn invalid(message: &str) -> payment::Error {
@@ -177,7 +199,30 @@ fn validate_request(
         payment_hash,
         amount_sat: amount.value(),
         cltv_expiry_delta,
+        lockup_script: parse_lockup(fields.lockup, &payment_hash, settings)?,
     })
+}
+
+fn parse_lockup(
+    lockup: Option<LockupFields>,
+    payment_hash: &[u8; 32],
+    settings: &Settings,
+) -> Result<Option<Vec<u8>>, payment::Error> {
+    let Some(lockup) = lockup else {
+        return Ok(None);
+    };
+
+    if !settings.auto_settle_onchain {
+        return Err(payment::Error::InvalidLockupScript);
+    }
+
+    let script = hex::decode(&lockup.script).map_err(|_| payment::Error::InvalidLockupScript)?;
+
+    if !lockup::commits_to_payment_hash(&script, payment_hash) {
+        return Err(payment::Error::InvalidLockupScript);
+    }
+
+    Ok(Some(script))
 }
 
 fn payment_hash_from_identifier(
@@ -298,11 +343,13 @@ impl LndHold {
             store,
             events,
             watched: Arc::new(Mutex::new(HashSet::new())),
+            lockups: Arc::new(Mutex::new(HashSet::new())),
         };
 
         tokio::spawn(poll_block_height(watcher.clone()));
         tokio::spawn(recover_pending_invoices(watcher.clone()));
         tokio::spawn(resume_pending_settles(watcher.clone()));
+        tokio::spawn(resume_lockup_watches(watcher.clone()));
 
         Ok(Self {
             settings,
@@ -313,6 +360,15 @@ impl LndHold {
     }
 }
 
+/// Effect of acting on the spend of a watched lockup
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockupSettle {
+    /// The quote needs no further watching
+    Resolved,
+    /// Keep watching, but leave the subscription so the spend is replayed
+    Reregister,
+}
+
 #[derive(Clone)]
 struct Watcher {
     client: client::Client,
@@ -320,6 +376,7 @@ struct Watcher {
     store: Arc<SettleStore>,
     events: broadcast::Sender<WaitPaymentResponse>,
     watched: Arc<Mutex<HashSet<[u8; 32]>>>,
+    lockups: Arc<Mutex<HashSet<[u8; 32]>>>,
 }
 
 impl Watcher {
@@ -407,6 +464,151 @@ impl Watcher {
             self.events.clone(),
             *payment_hash,
         ));
+    }
+
+    fn ensure_lockup_watch(&self, payment_hash: &[u8; 32]) {
+        let inserted = self
+            .lockups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(*payment_hash);
+
+        if !inserted {
+            return;
+        }
+
+        tokio::spawn(follow_lockup(self.clone(), *payment_hash));
+    }
+
+    fn stop_lockup_watch(&self, payment_hash: &[u8; 32]) {
+        self.lockups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(payment_hash);
+
+        if let Err(err) = self.store.unwatch_lockup(payment_hash) {
+            tracing::warn!(error = %err, "could not forget the lockup watch");
+        }
+    }
+
+    async fn lockup_resolved(&self, payment_hash: &[u8; 32]) -> bool {
+        if let Some(record) = self.tracker.get(payment_hash) {
+            match lockup_stop(record) {
+                Some(resolved) => return resolved,
+                None => return self.past_deadline(record).await,
+            }
+        }
+
+        match self.lookup_invoice(payment_hash).await {
+            Ok(Some(invoice)) => {
+                let record = self
+                    .tracker
+                    .observe(payment_hash, HoldStatus::from_invoice(&invoice));
+
+                match lockup_stop(record) {
+                    Some(resolved) => resolved,
+                    None => self.past_deadline(record).await,
+                }
+            }
+            Ok(None) => true,
+            Err(err) => {
+                tracing::warn!(error = %err, "could not look up the hold invoice");
+                false
+            }
+        }
+    }
+
+    async fn past_deadline(&self, record: HoldRecord) -> bool {
+        match (record.settle_deadline, self.block_height().await) {
+            (Some(deadline), Ok(height)) => height > deadline,
+            _ => false,
+        }
+    }
+
+    async fn settle_lockup(
+        &self,
+        payment_hash: &[u8; 32],
+        spending: &chainrpc::SpendDetails,
+    ) -> LockupSettle {
+        let Ok(tx) = deserialize::<Transaction>(&spending.raw_spending_tx) else {
+            tracing::warn!(
+                payment_hash = %hex::encode(payment_hash),
+                "could not parse the transaction spending the lockup; retrying the watch",
+            );
+            return LockupSettle::Reregister;
+        };
+
+        let Some(input) = tx.input.get(spending.spending_input_index as usize) else {
+            tracing::warn!(
+                payment_hash = %hex::encode(payment_hash),
+                "the transaction spending the lockup has no such input; retrying the watch",
+            );
+            return LockupSettle::Reregister;
+        };
+        let witness: Vec<Vec<u8>> = input.witness.iter().map(<[u8]>::to_vec).collect();
+
+        let Some(preimage) = lockup::extract_preimage(&witness, payment_hash) else {
+            tracing::info!(
+                payment_hash = %hex::encode(payment_hash),
+                spending_height = spending.spending_height,
+                "the lockup was spent without the preimage; nothing to settle",
+            );
+            return LockupSettle::Resolved;
+        };
+
+        tracing::info!(
+            payment_hash = %hex::encode(payment_hash),
+            spending_height = spending.spending_height,
+            "the lockup revealed the preimage; settling the held HTLCs",
+        );
+
+        for round in 0..LOCKUP_SETTLE_ROUNDS {
+            let record = match self.record(payment_hash).await {
+                Ok(record) => record,
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not read the hold record");
+                    tokio::time::sleep(SETTLE_RETRY_DELAY).await;
+                    continue;
+                }
+            };
+
+            let height = match self.block_height().await {
+                Ok(height) => Some(height),
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not read the block height");
+                    None
+                }
+            };
+
+            match lockup_attempt(
+                settle_decision(record, false, height),
+                LOCKUP_SETTLE_ROUNDS - round - 1,
+            ) {
+                LockupAttempt::Settle => {
+                    if let Err(err) =
+                        self.store
+                            .persist_preimage(payment_hash, &preimage, HoldState::Held)
+                    {
+                        tracing::warn!(error = %err, "could not persist the revealed preimage");
+                        tokio::time::sleep(SETTLE_RETRY_DELAY).await;
+                        continue;
+                    }
+
+                    settle_until_settled(self.clone(), *payment_hash, preimage).await;
+                    return LockupSettle::Resolved;
+                }
+                LockupAttempt::Resolved => return LockupSettle::Resolved,
+                LockupAttempt::Retry => tokio::time::sleep(SETTLE_RETRY_DELAY).await,
+                LockupAttempt::Defer => break,
+            }
+        }
+
+        tracing::warn!(
+            payment_hash = %hex::encode(payment_hash),
+            "the hold invoice is not held yet; keeping the watch so it can still settle",
+        );
+
+        LockupSettle::Reregister
     }
 }
 
@@ -714,6 +916,124 @@ async fn resume_pending_settles(watcher: Watcher) {
     }
 }
 
+async fn resume_lockup_watches(watcher: Watcher) {
+    let watches = loop {
+        match watcher.store.pending_lockups() {
+            Ok(watches) => break watches,
+            Err(err) => {
+                tracing::warn!(error = %err, "could not read the pending lockup watches; retrying");
+                tokio::time::sleep(SUBSCRIPTION_RETRY_DELAY).await;
+            }
+        }
+    };
+
+    for watch in watches {
+        tracing::info!(
+            payment_hash = %hex::encode(watch.payment_hash),
+            "resuming the lockup watch of a pending quote",
+        );
+        watcher.ensure_lockup_watch(&watch.payment_hash);
+    }
+}
+
+async fn follow_lockup(watcher: Watcher, payment_hash: [u8; 32]) {
+    loop {
+        if watcher.lockup_resolved(&payment_hash).await {
+            watcher.stop_lockup_watch(&payment_hash);
+            return;
+        }
+
+        let watch = match watcher.store.lockup_watch(&payment_hash) {
+            Ok(Some(watch)) => watch,
+            Ok(None) => {
+                watcher.stop_lockup_watch(&payment_hash);
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "could not read the lockup watch");
+                tokio::time::sleep(SUBSCRIPTION_RETRY_DELAY).await;
+                continue;
+            }
+        };
+
+        let request = chainrpc::SpendRequest {
+            outpoint: None,
+            script: lockup::p2wsh_script_pubkey(&watch.script),
+            height_hint: watch.height_hint,
+        };
+
+        let mut client = watcher.client.clone();
+        let registration = client.chain().register_spend_ntfn(Request::new(request));
+        tokio::pin!(registration);
+
+        let response = loop {
+            tokio::select! {
+                () = tokio::time::sleep(BLOCK_POLL_INTERVAL) => {
+                    if watcher.lockup_resolved(&payment_hash).await {
+                        watcher.stop_lockup_watch(&payment_hash);
+                        return;
+                    }
+                }
+                response = &mut registration => break response,
+            }
+        };
+
+        match response {
+            Ok(response) => {
+                if follow_lockup_spends(&watcher, &payment_hash, response.into_inner()).await {
+                    watcher.stop_lockup_watch(&payment_hash);
+                    return;
+                }
+            }
+            Err(status) => {
+                tracing::warn!(
+                    payment_hash = %hex::encode(payment_hash),
+                    error = %status,
+                    "LND RegisterSpendNtfn failed; retrying the lockup watch",
+                );
+            }
+        }
+
+        tokio::time::sleep(SUBSCRIPTION_RETRY_DELAY).await;
+    }
+}
+
+async fn follow_lockup_spends(
+    watcher: &Watcher,
+    payment_hash: &[u8; 32],
+    mut stream: tonic::Streaming<chainrpc::SpendEvent>,
+) -> bool {
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(BLOCK_POLL_INTERVAL) => {
+                if watcher.lockup_resolved(payment_hash).await {
+                    return true;
+                }
+            }
+            event = stream.next() => match event {
+                Some(Ok(event)) => match event.event {
+                    Some(chainrpc::spend_event::Event::Spend(spending)) => {
+                        match watcher.settle_lockup(payment_hash, &spending).await {
+                            LockupSettle::Resolved => return true,
+                            LockupSettle::Reregister => return false,
+                        }
+                    }
+                    Some(chainrpc::spend_event::Event::Reorg(_)) | None => {}
+                },
+                Some(Err(status)) => {
+                    tracing::warn!(
+                        payment_hash = %hex::encode(payment_hash),
+                        error = %status,
+                        "LND spend subscription closed; resubscribing",
+                    );
+                    return false;
+                }
+                None => return false,
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl MintPayment for LndHold {
     type Err = payment::Error;
@@ -773,6 +1093,20 @@ impl MintPayment for LndHold {
             .tracker
             .observe(&request.payment_hash, HoldStatus::unpaid());
         self.watcher.ensure_watching(&request.payment_hash);
+
+        if let Some(script) = &request.lockup_script {
+            let height_hint = self.watcher.block_height().await?;
+            self.watcher
+                .store
+                .watch_lockup(&request.payment_hash, script, height_hint)?;
+            self.watcher.ensure_lockup_watch(&request.payment_hash);
+
+            tracing::info!(
+                payment_hash = %hex::encode(request.payment_hash),
+                height_hint,
+                "watching the on-chain lockup of the quote",
+            );
+        }
 
         Ok(CreateIncomingPaymentResponse {
             request_lookup_id: PaymentIdentifier::PaymentHash(request.payment_hash),
@@ -994,6 +1328,17 @@ mod tests {
         validate_request(amount(), Some(extra_json), &Settings::default())
     }
 
+    fn validate_with(
+        settings: &Settings,
+        extra_json: &str,
+    ) -> Result<HoldInvoiceRequest, payment::Error> {
+        validate_request(amount(), Some(extra_json), settings)
+    }
+
+    const SWAP_SCRIPT: &str = "8201208763a914ea4beb47def8492389a1e16634795441e1b8724588210311111111111111111111111111111111111111111111111111111111111111116775022003b1752102222222222222222222222222222222222222222222222222222222222222222268ac";
+    const SWAP_PAYMENT_HASH: &str =
+        "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd";
+
     fn hash_hex() -> String {
         hex::encode([7u8; 32])
     }
@@ -1006,6 +1351,82 @@ mod tests {
         assert_eq!(options["max_final_cltv_expiry_delta"], 576);
         assert_eq!(options["settle_margin_blocks"], 22);
         assert_eq!(options["max_pending_quotes"], 100);
+        assert_eq!(options["auto_settle_onchain"], true);
+
+        let disabled = Settings {
+            auto_settle_onchain: false,
+            ..Settings::default()
+        };
+        assert_eq!(disabled.options_json()["auto_settle_onchain"], false);
+    }
+
+    fn lockup_request(script: &str, payment_hash: &str) -> String {
+        format!(r#"{{"payment_hash":"{payment_hash}","lockup":{{"script":"{script}"}}}}"#)
+    }
+
+    #[test]
+    fn request_accepts_a_lockup_script_of_the_payment_hash() {
+        let request =
+            validate(&lockup_request(SWAP_SCRIPT, SWAP_PAYMENT_HASH)).expect("valid lockup");
+
+        assert_eq!(
+            request.lockup_script,
+            Some(hex::decode(SWAP_SCRIPT).expect("fixture script"))
+        );
+    }
+
+    #[test]
+    fn request_without_a_lockup_watches_nothing() {
+        let request =
+            validate(&format!(r#"{{"payment_hash":"{}"}}"#, hash_hex())).expect("valid request");
+
+        assert_eq!(request.lockup_script, None);
+    }
+
+    #[test]
+    fn request_rejects_an_invalid_lockup_script() {
+        for script in [
+            String::new(),
+            "zz".to_string(),
+            "00".to_string(),
+            SWAP_SCRIPT[..SWAP_SCRIPT.len() - 2].to_string(),
+        ] {
+            assert!(
+                matches!(
+                    validate(&lockup_request(&script, SWAP_PAYMENT_HASH)),
+                    Err(payment::Error::InvalidLockupScript)
+                ),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_rejects_a_lockup_script_of_another_payment_hash() {
+        let other = hex::encode([7u8; 32]);
+
+        assert!(matches!(
+            validate(&lockup_request(SWAP_SCRIPT, &other)),
+            Err(payment::Error::InvalidLockupScript)
+        ));
+    }
+
+    #[test]
+    fn request_rejects_a_lockup_when_auto_settle_is_disabled() {
+        let settings = Settings {
+            auto_settle_onchain: false,
+            ..Settings::default()
+        };
+
+        assert!(matches!(
+            validate_with(&settings, &lockup_request(SWAP_SCRIPT, SWAP_PAYMENT_HASH)),
+            Err(payment::Error::InvalidLockupScript)
+        ));
+        assert!(validate_with(
+            &settings,
+            &format!(r#"{{"payment_hash":"{}"}}"#, hash_hex())
+        )
+        .is_ok());
     }
 
     #[test]

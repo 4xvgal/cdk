@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package chainrpc;
+
+service ChainNotifier {
+    rpc RegisterConfirmationsNtfn (ConfRequest) returns (stream ConfEvent);
+
+    rpc RegisterSpendNtfn (SpendRequest) returns (stream SpendEvent);
+}
+
+message ConfRequest {
+    bytes txid = 1;
+    bytes script = 2;
+    uint32 num_confs = 3;
+    uint32 height_hint = 4;
+    bool include_block = 5;
+}
+
+message ConfDetails {
+    bytes raw_tx = 1;
+    bytes block_hash = 2;
+    uint32 block_height = 3;
+    uint32 tx_index = 4;
+    bytes raw_block = 5;
+}
+
+message Reorg {}
+
+message ConfEvent {
+    oneof event {
+        ConfDetails conf = 1;
+        Reorg reorg = 2;
+    }
+}
+
+message Outpoint {
+    bytes hash = 1;
+    uint32 index = 2;
+}
+
+message SpendRequest {
+    Outpoint outpoint = 1;
+    bytes script = 2;
+    uint32 height_hint = 3;
+}
+
+message SpendDetails {
+    Outpoint spending_outpoint = 1;
+    bytes raw_spending_tx = 2;
+    bytes spending_tx_hash = 3;
+    uint32 spending_input_index = 4;
+    uint32 spending_height = 5;
+}
+
+message SpendEvent {
+    oneof event {
+        SpendDetails spend = 1;
+        Reorg reorg = 2;
+    }
+}

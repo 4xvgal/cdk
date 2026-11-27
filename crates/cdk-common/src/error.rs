@@ -724,6 +724,11 @@ mod tests {
                 ErrorCode::InvalidCltvDelta,
                 20016,
             ),
+            (
+                crate::payment::Error::InvalidLockupScript,
+                ErrorCode::InvalidLockupScript,
+                20017,
+            ),
         ] {
             let response = ErrorResponse::from(Error::Payment(error));
 
@@ -734,11 +739,13 @@ mod tests {
 
         assert_eq!(ErrorCode::PaymentHashAlreadyUsed.to_code(), 20015);
         assert_eq!(ErrorCode::InvalidCltvDelta.to_code(), 20016);
+        assert_eq!(ErrorCode::InvalidLockupScript.to_code(), 20017);
         assert_eq!(
             ErrorCode::from_code(20015),
             ErrorCode::PaymentHashAlreadyUsed
         );
         assert_eq!(ErrorCode::from_code(20016), ErrorCode::InvalidCltvDelta);
+        assert_eq!(ErrorCode::from_code(20017), ErrorCode::InvalidLockupScript);
         assert!(matches!(
             Error::from(ErrorResponse {
                 code: ErrorCode::PaymentHashAlreadyUsed,
@@ -1232,6 +1239,11 @@ impl From<Error> for ErrorResponse {
                 detail: err.to_string(),
             },
             #[cfg(feature = "mint")]
+            Error::Payment(crate::payment::Error::InvalidLockupScript) => ErrorResponse {
+                code: ErrorCode::InvalidLockupScript,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "mint")]
             Error::Payment(payment_error) => {
                 tracing::error!(error = %payment_error, "Payment backend error");
                 ErrorResponse {
@@ -1396,6 +1408,10 @@ impl From<ErrorResponse> for Error {
             }
             #[cfg(feature = "mint")]
             ErrorCode::InvalidCltvDelta => Self::Payment(crate::payment::Error::InvalidCltvDelta),
+            #[cfg(feature = "mint")]
+            ErrorCode::InvalidLockupScript => {
+                Self::Payment(crate::payment::Error::InvalidLockupScript)
+            }
             // 30xxx - Clear auth errors
             ErrorCode::ClearAuthRequired => Self::ClearAuthRequired,
             ErrorCode::ClearAuthFailed => Self::ClearAuthFailed,
@@ -1502,6 +1518,8 @@ pub enum ErrorCode {
     PaymentHashAlreadyUsed,
     /// Final CLTV expiry delta outside of allowed range (20016)
     InvalidCltvDelta,
+    /// Lockup script invalid or not supported (20017)
+    InvalidLockupScript,
 
     // 30xxx - Clear auth errors
     /// Endpoint requires clear auth (30001)
@@ -1570,6 +1588,7 @@ impl ErrorCode {
             20014 => Self::SettleDeadlinePassed,
             20015 => Self::PaymentHashAlreadyUsed,
             20016 => Self::InvalidCltvDelta,
+            20017 => Self::InvalidLockupScript,
             // 30xxx - Clear auth errors
             30001 => Self::ClearAuthRequired,
             30002 => Self::ClearAuthFailed,
@@ -1625,6 +1644,7 @@ impl ErrorCode {
             Self::SettleDeadlinePassed => 20014,
             Self::PaymentHashAlreadyUsed => 20015,
             Self::InvalidCltvDelta => 20016,
+            Self::InvalidLockupScript => 20017,
             // 30xxx - Clear auth errors
             Self::ClearAuthRequired => 30001,
             Self::ClearAuthFailed => 30002,

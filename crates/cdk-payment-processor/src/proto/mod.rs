@@ -22,6 +22,7 @@ pub(crate) const SETTLE_DEADLINE_PASSED: &str = "Settle deadline has passed";
 pub(crate) const CREATE_PAYMENT_HASH_ALREADY_USED: &str = "Payment hash already used";
 pub(crate) const CREATE_INVALID_CLTV_DELTA: &str =
     "Final CLTV expiry delta is outside of the allowed range";
+pub(crate) const CREATE_INVALID_LOCKUP_SCRIPT: &str = "Lockup script is invalid or not supported";
 
 tonic::include_proto!("cdk_payment_processor");
 

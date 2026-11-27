@@ -63,6 +63,9 @@ pub enum Error {
     /// Final CLTV expiry delta is outside of the allowed range
     #[error("Final CLTV expiry delta is outside of the allowed range")]
     InvalidCltvDelta,
+    /// On-chain lockup script is invalid or not supported
+    #[error("Lockup script is invalid or not supported")]
+    InvalidLockupScript,
     /// Payment backend error
     #[error(transparent)]
     Backend(Box<dyn std::error::Error + Send + Sync>),

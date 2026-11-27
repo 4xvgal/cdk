@@ -38,7 +38,7 @@ pub mod error;
 
 mod proto;
 #[doc(hidden)]
-pub use proto::{invoicesrpc, lnrpc, routerrpc};
+pub use proto::{chainrpc, invoicesrpc, lnrpc, routerrpc};
 
 use crate::lnrpc::invoice::InvoiceState;
 

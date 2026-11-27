@@ -20,7 +20,7 @@ use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
 
-use crate::{invoicesrpc, lnrpc, routerrpc, Error};
+use crate::{chainrpc, invoicesrpc, lnrpc, routerrpc, Error};
 
 /// Custom certificate verifier for LND's self-signed certificates
 #[derive(Debug)]
@@ -137,6 +137,14 @@ pub type InvoicesClient = invoicesrpc::invoices_client::InvoicesClient<
     >,
 >;
 
+/// Chain notifier client used for spend and confirmation notifications
+pub type ChainNotifierClient = chainrpc::chain_notifier_client::ChainNotifierClient<
+    InterceptedService<
+        HyperClient<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
+        MacaroonInterceptor,
+    >,
+>;
+
 /// The client returned by `connect` function
 #[derive(Clone)]
 pub struct Client {
@@ -148,6 +156,7 @@ pub struct Client {
     >,
     router: RouterClient,
     invoices: InvoicesClient,
+    chain: ChainNotifierClient,
 }
 
 impl std::fmt::Debug for Client {
@@ -229,12 +238,14 @@ pub async fn connect<P: AsRef<Path>>(
     let lightning =
         lnrpc::lightning_client::LightningClient::with_origin(service.clone(), uri.clone());
     let router = RouterClient::with_origin(service.clone(), uri.clone());
-    let invoices = InvoicesClient::with_origin(service, uri);
+    let invoices = InvoicesClient::with_origin(service.clone(), uri.clone());
+    let chain = ChainNotifierClient::with_origin(service, uri);
 
     Ok(Client {
         lightning,
         router,
         invoices,
+        chain,
     })
 }
 
@@ -259,5 +270,10 @@ impl Client {
     /// Invoices client
     pub fn invoices(&mut self) -> &mut InvoicesClient {
         &mut self.invoices
+    }
+
+    /// Chain notifier client
+    pub fn chain(&mut self) -> &mut ChainNotifierClient {
+        &mut self.chain
     }
 }

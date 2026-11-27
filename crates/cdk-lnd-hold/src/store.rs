@@ -15,6 +15,17 @@ pub struct SettleRecord {
     pub preimage: [u8; 32],
 }
 
+/// On-chain lockup watched for the preimage of one hold invoice
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockupWatch {
+    /// Payment hash of the hold invoice the lockup settles
+    pub payment_hash: [u8; 32],
+    /// Redeem script of the lockup
+    pub script: Vec<u8>,
+    /// Height from which LND reports spends of the lockup
+    pub height_hint: u32,
+}
+
 /// SQLite store of the preimages and hold states owned by the processor
 ///
 /// A persisted preimage is the promise to settle: it survives restarts and
@@ -43,6 +54,16 @@ impl SettleStore {
                     payment_hash BLOB PRIMARY KEY,
                     preimage BLOB NOT NULL,
                     hold_state TEXT NOT NULL
+                )",
+            )
+            .map_err(store_error)?;
+
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS lockup_watch (
+                    payment_hash BLOB PRIMARY KEY,
+                    script BLOB NOT NULL,
+                    height_hint INTEGER NOT NULL
                 )",
             )
             .map_err(store_error)?;
@@ -127,6 +148,91 @@ impl SettleStore {
         }
 
         Ok(records)
+    }
+
+    /// Watch `script` for the preimage of `payment_hash` from `height_hint` on
+    pub fn watch_lockup(
+        &self,
+        payment_hash: &[u8; 32],
+        script: &[u8],
+        height_hint: u32,
+    ) -> Result<(), payment::Error> {
+        self.connection()
+            .execute(
+                "INSERT INTO lockup_watch (payment_hash, script, height_hint) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(payment_hash) DO NOTHING",
+                params![payment_hash.as_slice(), script, height_hint],
+            )
+            .map_err(store_error)?;
+
+        Ok(())
+    }
+
+    /// Lockup watched for `payment_hash`, if any
+    pub fn lockup_watch(
+        &self,
+        payment_hash: &[u8; 32],
+    ) -> Result<Option<LockupWatch>, payment::Error> {
+        let row: Option<(Vec<u8>, i64)> = self
+            .connection()
+            .query_row(
+                "SELECT script, height_hint FROM lockup_watch WHERE payment_hash = ?1",
+                params![payment_hash.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(store_error)?;
+
+        row.map(|(script, height_hint)| {
+            Ok(LockupWatch {
+                payment_hash: *payment_hash,
+                script,
+                height_hint: u32::try_from(height_hint).map_err(|_| payment::Error::InvalidHash)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Lockups to watch, the ones that survived a restart
+    pub fn pending_lockups(&self) -> Result<Vec<LockupWatch>, payment::Error> {
+        let connection = self.connection();
+        let mut statement = connection
+            .prepare("SELECT payment_hash, script, height_hint FROM lockup_watch")
+            .map_err(store_error)?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(store_error)?;
+
+        let mut watches = Vec::new();
+        for row in rows {
+            let (payment_hash, script, height_hint) = row.map_err(store_error)?;
+            watches.push(LockupWatch {
+                payment_hash: hash_from_bytes(&payment_hash)?,
+                script,
+                height_hint: u32::try_from(height_hint).map_err(|_| payment::Error::InvalidHash)?,
+            });
+        }
+
+        Ok(watches)
+    }
+
+    /// Stop watching the lockup of `payment_hash`
+    pub fn unwatch_lockup(&self, payment_hash: &[u8; 32]) -> Result<(), payment::Error> {
+        self.connection()
+            .execute(
+                "DELETE FROM lockup_watch WHERE payment_hash = ?1",
+                params![payment_hash.as_slice()],
+            )
+            .map_err(store_error)?;
+
+        Ok(())
     }
 
     fn connection(&self) -> MutexGuard<'_, Connection> {
@@ -248,6 +354,43 @@ mod tests {
 
         assert_eq!(store.preimage(&hash(7)).expect("read"), None);
         assert!(store.pending_settles().expect("pending").is_empty());
+    }
+
+    #[test]
+    fn lockup_watch_round_trip() {
+        let store = SettleStore::in_memory().expect("in-memory store");
+        let script = vec![0x51u8, 0x52];
+
+        assert_eq!(store.lockup_watch(&hash(7)).expect("read"), None);
+
+        store.watch_lockup(&hash(7), &script, 120).expect("watch");
+
+        let expected = LockupWatch {
+            payment_hash: hash(7),
+            script: script.clone(),
+            height_hint: 120,
+        };
+        assert_eq!(
+            store.lockup_watch(&hash(7)).expect("read"),
+            Some(expected.clone())
+        );
+        assert_eq!(store.pending_lockups().expect("pending"), vec![expected]);
+
+        store
+            .watch_lockup(&hash(7), &script, 200)
+            .expect("watch again");
+        assert_eq!(
+            store
+                .lockup_watch(&hash(7))
+                .expect("read")
+                .map(|watch| watch.height_hint),
+            Some(120),
+            "the first height hint is kept"
+        );
+
+        store.unwatch_lockup(&hash(7)).expect("unwatch");
+        assert_eq!(store.pending_lockups().expect("pending"), vec![]);
+        assert_eq!(store.lockup_watch(&hash(7)).expect("read"), None);
     }
 
     #[test]
