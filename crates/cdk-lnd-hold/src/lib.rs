@@ -207,10 +207,10 @@ fn is_already_cancelled(status: &tonic::Status) -> bool {
 }
 
 fn is_hash_already_used(status: &tonic::Status) -> bool {
-    status
-        .message()
-        .to_lowercase()
-        .contains("invoice with that hash already exists")
+    let message = status.message().to_lowercase();
+
+    message.contains("invoice with payment hash already exists")
+        || message.contains("invoice with that hash already exists")
 }
 
 fn is_already_settled(status: &tonic::Status) -> bool {
@@ -222,6 +222,24 @@ fn settle_extra_json(record: HoldRecord, preimage_persisted: bool) -> Value {
 
     if let Value::Object(fields) = &mut extra {
         fields.insert("preimage_persisted".to_string(), json!(preimage_persisted));
+    }
+
+    extra
+}
+
+fn created_extra(request: &HoldInvoiceRequest, settle_margin_blocks: u32) -> Value {
+    let mut extra =
+        HoldRecord::from_status(HoldStatus::unpaid(), settle_margin_blocks).extra_json();
+
+    if let Value::Object(fields) = &mut extra {
+        fields.insert(
+            "payment_hash".to_string(),
+            json!(hex::encode(request.payment_hash)),
+        );
+        fields.insert(
+            "min_final_cltv_expiry_delta".to_string(),
+            json!(request.cltv_expiry_delta),
+        );
     }
 
     extra
@@ -760,10 +778,7 @@ impl MintPayment for LndHold {
             request_lookup_id: PaymentIdentifier::PaymentHash(request.payment_hash),
             expiry: bolt11.expires_at().map(|time| time.as_secs()),
             request: bolt11.to_string(),
-            extra_json: Some(json!({
-                "payment_hash": hex::encode(request.payment_hash),
-                "min_final_cltv_expiry_delta": request.cltv_expiry_delta,
-            })),
+            extra_json: Some(created_extra(&request, self.settings.settle_margin_blocks)),
         })
     }
 
@@ -1067,8 +1082,10 @@ mod tests {
     #[test]
     fn duplicate_hash_status_maps_to_payment_hash_already_used() {
         let status = tonic::Status::unknown("invoice with that hash already exists (hash=07)");
+        let lnd_status = tonic::Status::unknown("invoice with payment hash already exists");
 
         assert!(is_hash_already_used(&status));
+        assert!(is_hash_already_used(&lnd_status));
         assert!(!is_hash_already_used(&tonic::Status::unknown("other")));
     }
 
@@ -1088,6 +1105,22 @@ mod tests {
         assert_eq!(add_request.memo, "swap");
         assert_eq!(add_request.expiry, 3600);
         assert_eq!(add_request.cltv_expiry, 432);
+    }
+
+    #[test]
+    fn created_extra_reports_unpaid_hold_and_request_fields() {
+        let request = validate(&format!(
+            r#"{{"payment_hash":"{}","min_final_cltv_expiry_delta":432}}"#,
+            hash_hex()
+        ))
+        .expect("valid request");
+
+        let extra = created_extra(&request, 22);
+
+        assert_eq!(extra["hold_state"], "UNPAID");
+        assert_eq!(extra["settle_deadline"], Value::Null);
+        assert_eq!(extra["payment_hash"], hash_hex());
+        assert_eq!(extra["min_final_cltv_expiry_delta"], 432);
     }
 
     #[test]
