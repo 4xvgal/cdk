@@ -644,18 +644,13 @@ impl Mint {
                 .await?;
 
             if let Some(extra) = settle_response.extra_json {
-                let mut tx = self.localstore.begin_transaction().await?;
-                let mut quote = tx
-                    .get_mint_quote(quote_id)
-                    .await?
-                    .ok_or(Error::UnknownQuote)?;
-
-                if quote.merge_extra(extra) {
-                    let updated_at = tx.update_mint_quote_extra(&mut quote).await?;
-                    quote.set_updated_at(updated_at);
-                }
-
-                tx.commit().await?;
+                Mint::refresh_mint_quote_extra(
+                    &self.localstore,
+                    Some(&self.pubsub_manager),
+                    quote_id,
+                    extra,
+                )
+                .await?;
             }
 
             for payment in payment_backend
@@ -1167,6 +1162,7 @@ mod batch_mint_tests {
         unit: CurrencyUnit,
         confirmations: u32,
         check_count: Arc<AtomicUsize>,
+        extra_check_count: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -1230,6 +1226,14 @@ mod batch_mint_tests {
             Ok(Vec::new())
         }
 
+        async fn check_incoming_payment_extra(
+            &self,
+            _payment_identifier: &PaymentIdentifier,
+        ) -> Result<Option<serde_json::Value>, Self::Err> {
+            self.extra_check_count.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+
         async fn check_outgoing_payment(
             &self,
             _payment_identifier: &PaymentIdentifier,
@@ -1281,7 +1285,7 @@ mod batch_mint_tests {
     async fn create_test_mint_with_onchain_limits_and_counter(
         onchain_min: u64,
         onchain_max: u64,
-    ) -> (Mint, Arc<AtomicUsize>) {
+    ) -> (Mint, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
 
         let mut mint_builder = MintBuilder::new(db.clone());
@@ -1310,10 +1314,12 @@ mod batch_mint_tests {
             .unwrap();
 
         let onchain_check_count = Arc::new(AtomicUsize::new(0));
+        let onchain_extra_check_count = Arc::new(AtomicUsize::new(0));
         let onchain_backend = OnchainTestBackend {
             unit: CurrencyUnit::Sat,
             confirmations: 1,
             check_count: onchain_check_count.clone(),
+            extra_check_count: onchain_extra_check_count.clone(),
         };
 
         mint_builder
@@ -1345,12 +1351,13 @@ mod batch_mint_tests {
 
         mint.start().await.unwrap();
 
-        (mint, onchain_check_count)
+        (mint, onchain_check_count, onchain_extra_check_count)
     }
 
     #[tokio::test]
     async fn repeated_quote_status_checks_throttle_payment_backend() {
-        let (mint, check_count) = create_test_mint_with_onchain_limits_and_counter(1, 10_000).await;
+        let (mint, check_count, _) =
+            create_test_mint_with_onchain_limits_and_counter(1, 10_000).await;
         let quote_id = QuoteId::new();
         let now = cdk_common::util::unix_time();
         let pubkey = PublicKey::from_hex(
@@ -1413,6 +1420,46 @@ mod batch_mint_tests {
             )
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn known_method_quote_checks_do_not_ask_for_extra() {
+        let (mint, check_count, extra_check_count) =
+            create_test_mint_with_onchain_limits_and_counter(1, 10_000).await;
+        let quote_id = QuoteId::new();
+        let now = cdk_common::util::unix_time();
+        let pubkey = PublicKey::from_hex(
+            "03d56ce4e446a85bbdaa547b4ec2b073d40ff802831352b8272b7dd7a4de5a7cac",
+        )
+        .expect("test public key");
+        let quote = MintQuote::new(
+            Some(quote_id.clone()),
+            "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh".to_string(),
+            CurrencyUnit::Sat,
+            None,
+            0,
+            PaymentIdentifier::QuoteId(quote_id.clone()),
+            Some(pubkey),
+            Amount::new(0, CurrencyUnit::Sat),
+            Amount::new(0, CurrencyUnit::Sat),
+            PaymentMethod::Known(KnownMethod::Onchain),
+            now,
+            now,
+            vec![],
+            vec![],
+            None,
+        );
+
+        let mut tx = mint.localstore().begin_transaction().await.unwrap();
+        tx.add_mint_quote(quote).await.unwrap();
+        tx.commit().await.unwrap();
+
+        mint.check_mint_quote(&quote_id)
+            .await
+            .expect("quote status check");
+
+        assert_eq!(check_count.load(Ordering::Relaxed), 1);
+        assert_eq!(extra_check_count.load(Ordering::Relaxed), 0);
     }
 
     async fn configure_nut29(

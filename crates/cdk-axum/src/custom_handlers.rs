@@ -819,7 +819,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -1370,6 +1370,23 @@ mod tests {
         DeadlinePassed,
     }
 
+    fn unpaid_hold_extra() -> Value {
+        serde_json::json!({
+            "payment_hash": HOLD_PAYMENT_HASH,
+            "min_final_cltv_expiry_delta": 432,
+            "hold_state": "UNPAID",
+            "settle_deadline": null,
+        })
+    }
+
+    fn held_hold_extra() -> Value {
+        serde_json::json!({
+            "hold_state": "HELD",
+            "min_htlc_expiry_height": HOLD_SETTLE_DEADLINE,
+            "settle_deadline": HOLD_SETTLE_DEADLINE,
+        })
+    }
+
     fn settled_hold_extra() -> Value {
         serde_json::json!({
             "hold_state": "SETTLED",
@@ -1380,6 +1397,7 @@ mod tests {
     struct HoldBackend {
         behavior: SettleBehavior,
         settled: Arc<AtomicBool>,
+        check_extra: Arc<Mutex<Value>>,
     }
 
     impl HoldBackend {
@@ -1387,6 +1405,7 @@ mod tests {
             Self {
                 behavior,
                 settled: Arc::new(AtomicBool::new(false)),
+                check_extra: Arc::new(Mutex::new(unpaid_hold_extra())),
             }
         }
     }
@@ -1414,12 +1433,7 @@ mod tests {
                     request_lookup_id: PaymentIdentifier::CustomId(HOLD_LOOKUP_ID.to_string()),
                     request: "bolt11-hold-request".to_string(),
                     expiry: Some(10_000),
-                    extra_json: Some(serde_json::json!({
-                        "payment_hash": HOLD_PAYMENT_HASH,
-                        "min_final_cltv_expiry_delta": 432,
-                        "hold_state": "UNPAID",
-                        "settle_deadline": null,
-                    })),
+                    extra_json: Some(unpaid_hold_extra()),
                 }),
                 _ => Err(cdk_payment::Error::UnsupportedPaymentOption),
             }
@@ -1468,6 +1482,13 @@ mod tests {
             }])
         }
 
+        async fn check_incoming_payment_extra(
+            &self,
+            _payment_identifier: &PaymentIdentifier,
+        ) -> Result<Option<Value>, Self::Err> {
+            Ok(Some(self.check_extra.lock().unwrap().clone()))
+        }
+
         async fn settle_incoming_payment(
             &self,
             method: &str,
@@ -1511,16 +1532,18 @@ mod tests {
         }
     }
 
-    async fn create_test_state_with_hold_backend(behavior: SettleBehavior) -> MintState {
+    async fn create_hold_state(behavior: SettleBehavior) -> (MintState, Arc<Mutex<Value>>) {
         let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
         let mut builder = MintBuilder::new(db.clone());
+        let backend = Arc::new(HoldBackend::new(behavior));
+        let check_extra = Arc::clone(&backend.check_extra);
 
         builder
             .add_payment_processor(
                 CurrencyUnit::Sat,
                 PaymentMethod::Custom(HOLD_METHOD.to_string()),
                 MintMeltLimits::new(1, 10_000),
-                Arc::new(HoldBackend::new(behavior)),
+                backend,
             )
             .await
             .unwrap();
@@ -1535,10 +1558,16 @@ mod tests {
             .unwrap();
         mint.start().await.unwrap();
 
-        MintState {
+        let state = MintState {
             mint: Arc::new(mint),
             cache: Arc::new(HttpCache::default()),
-        }
+        };
+
+        (state, check_extra)
+    }
+
+    async fn create_test_state_with_hold_backend(behavior: SettleBehavior) -> MintState {
+        create_hold_state(behavior).await.0
     }
 
     async fn settle_hold_quote(
@@ -1596,6 +1625,93 @@ mod tests {
         assert_eq!(value["amount_issued"].as_u64(), Some(0));
         assert_eq!(value["hold_state"].as_str(), Some("HELD"));
         assert_eq!(value["payment_hash"].as_str(), Some(HOLD_PAYMENT_HASH));
+    }
+
+    #[tokio::test]
+    async fn get_check_mint_custom_quote_surfaces_held_state() {
+        let (state, check_extra) = create_hold_state(SettleBehavior::Settle).await;
+        let quote_id = create_custom_quote(&state, HOLD_METHOD, HOLD_AMOUNT_SAT).await;
+
+        *check_extra.lock().unwrap() = held_hold_extra();
+
+        let response = get_check_mint_custom_quote(
+            AuthHeader::None,
+            State(state),
+            Path((HOLD_METHOD.to_string(), quote_id)),
+        )
+        .await
+        .expect("checking a held quote must succeed");
+
+        let value = response_json(response).await;
+
+        assert_eq!(value["hold_state"].as_str(), Some("HELD"));
+        assert_eq!(
+            value["settle_deadline"].as_u64(),
+            Some(HOLD_SETTLE_DEADLINE)
+        );
+        assert_eq!(value["payment_hash"].as_str(), Some(HOLD_PAYMENT_HASH));
+        assert_eq!(value["amount_paid"].as_u64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn get_check_mint_custom_quote_surfaces_cancelled_state() {
+        let (state, check_extra) = create_hold_state(SettleBehavior::Settle).await;
+        let quote_id = create_custom_quote(&state, HOLD_METHOD, HOLD_AMOUNT_SAT).await;
+
+        *check_extra.lock().unwrap() = serde_json::json!({
+            "hold_state": "CANCELLED",
+            "min_htlc_expiry_height": serde_json::Value::Null,
+            "settle_deadline": serde_json::Value::Null,
+        });
+
+        let response = get_check_mint_custom_quote(
+            AuthHeader::None,
+            State(state),
+            Path((HOLD_METHOD.to_string(), quote_id)),
+        )
+        .await
+        .expect("checking a cancelled quote must succeed");
+
+        let value = response_json(response).await;
+
+        assert_eq!(value["hold_state"].as_str(), Some("CANCELLED"));
+        assert_eq!(value["payment_hash"].as_str(), Some(HOLD_PAYMENT_HASH));
+        assert_eq!(value["amount_paid"].as_u64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn get_check_mint_custom_quote_does_not_regress_a_settled_hold_state() {
+        let (state, check_extra) = create_hold_state(SettleBehavior::Settle).await;
+        let quote_id = create_custom_quote(&state, HOLD_METHOD, HOLD_AMOUNT_SAT).await;
+
+        post_settle_mint_custom_quote(
+            AuthHeader::None,
+            State(state.clone()),
+            Path((HOLD_METHOD.to_string(), quote_id.clone())),
+            Json(serde_json::json!({ "preimage": HOLD_PREIMAGE })),
+        )
+        .await
+        .expect("settling a held quote must succeed");
+
+        *check_extra.lock().unwrap() = held_hold_extra();
+
+        let response = get_check_mint_custom_quote(
+            AuthHeader::None,
+            State(state),
+            Path((HOLD_METHOD.to_string(), quote_id)),
+        )
+        .await
+        .expect("checking a settled quote must succeed");
+
+        let value = response_json(response).await;
+
+        assert_eq!(value["hold_state"].as_str(), Some("SETTLED"));
+        assert_eq!(
+            value["settle_deadline"].as_u64(),
+            Some(HOLD_SETTLE_DEADLINE)
+        );
+        assert_eq!(value["payment_hash"].as_str(), Some(HOLD_PAYMENT_HASH));
+        assert_eq!(value["amount_paid"].as_u64(), Some(HOLD_AMOUNT_SAT));
     }
 
     #[tokio::test]

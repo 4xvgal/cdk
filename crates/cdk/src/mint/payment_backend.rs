@@ -5,8 +5,10 @@ use cdk_common::common::PaymentProcessorKey;
 use cdk_common::database::DynMintDatabase;
 use cdk_common::mint::MintQuote;
 use cdk_common::payment::DynMintPayment;
+use cdk_common::quote_id::QuoteId;
 use cdk_common::util::unix_time;
 use cdk_common::MintQuoteState;
+use serde_json::Value;
 use tracing::instrument;
 
 use super::subscription::PubSubManager;
@@ -15,6 +17,48 @@ use crate::Error;
 
 /// Minimum delay between payment backend status checks for the same mint quote.
 pub(super) const MINT_QUOTE_PAYMENT_CHECK_INTERVAL_SECS: u64 = 10;
+
+fn hold_state_rank(state: &str) -> Option<u8> {
+    match state {
+        "UNPAID" => Some(0),
+        "HELD" => Some(1),
+        "SETTLED" | "CANCELLED" => Some(2),
+        _ => None,
+    }
+}
+
+fn allowed_extra_update(stored: Option<&Value>, mut update: Value) -> Option<Value> {
+    if let Some(stored) = stored {
+        let stored_state = stored.get("hold_state").and_then(Value::as_str);
+        let update_state = update.get("hold_state").and_then(Value::as_str);
+
+        if let (Some(stored_state), Some(update_state)) = (stored_state, update_state) {
+            let forward = match (hold_state_rank(stored_state), hold_state_rank(update_state)) {
+                (Some(stored_rank), Some(update_rank)) => {
+                    update_rank > stored_rank
+                        || (update_rank == stored_rank && update_state == stored_state)
+                }
+                _ => true,
+            };
+
+            if !forward {
+                return None;
+            }
+        }
+
+        let keeps_deadline = stored
+            .get("settle_deadline")
+            .is_some_and(|value| !value.is_null());
+
+        if keeps_deadline && update.get("settle_deadline") == Some(&Value::Null) {
+            if let Some(object) = update.as_object_mut() {
+                object.remove("settle_deadline");
+            }
+        }
+    }
+
+    Some(update)
+}
 
 impl Mint {
     /// Static implementation of check_mint_quote_paid to avoid circular dependency to the Mint
@@ -69,6 +113,34 @@ impl Mint {
                 return Err(Error::UnsupportedUnit);
             }
         };
+
+        if let cdk_common::PaymentMethod::Custom(_) = quote.payment_method {
+            match payment_backend
+                .check_incoming_payment_extra(&quote.request_lookup_id)
+                .await
+            {
+                Ok(Some(extra)) => {
+                    if let Some(refreshed) = Self::refresh_mint_quote_extra(
+                        &localstore,
+                        pubsub_manager.as_ref(),
+                        &quote.id,
+                        extra,
+                    )
+                    .await?
+                    {
+                        *quote = refreshed;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    quote_id = %quote.id,
+                    method = %quote.payment_method,
+                    request_lookup_id = %quote.request_lookup_id,
+                    error = %err,
+                    "mint quote extra check failed; hold state is unchanged",
+                ),
+            }
+        }
 
         let payment_status = payment_backend
             .check_incoming_payment_status(&quote.request_lookup_id)
@@ -176,6 +248,41 @@ impl Mint {
         *quote = new_quote.inner();
 
         Ok(())
+    }
+
+    pub(super) async fn refresh_mint_quote_extra(
+        localstore: &DynMintDatabase,
+        pubsub_manager: Option<&Arc<PubSubManager>>,
+        quote_id: &QuoteId,
+        extra: Value,
+    ) -> Result<Option<MintQuote>, Error> {
+        let mut tx = localstore.begin_transaction().await?;
+        let mut quote = tx
+            .get_mint_quote(quote_id)
+            .await?
+            .ok_or(Error::UnknownQuote)?;
+
+        let Some(extra) = allowed_extra_update(quote.extra_json.as_ref(), extra) else {
+            tracing::debug!(
+                quote_id = %quote.id,
+                "ignored a backend extra update that would move the hold state backwards",
+            );
+            return Ok(None);
+        };
+
+        if !quote.merge_extra(extra) {
+            return Ok(None);
+        }
+
+        let updated_at = tx.update_mint_quote_extra(&mut quote).await?;
+        quote.set_updated_at(updated_at);
+        tx.commit().await?;
+
+        if let Some(pubsub_manager) = pubsub_manager {
+            pubsub_manager.mint_quote_payment(&quote, quote.amount_paid());
+        }
+
+        Ok(Some(quote.inner()))
     }
 
     /// Check the status of a payment for a quote with the payment backend
