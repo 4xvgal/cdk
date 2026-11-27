@@ -601,6 +601,88 @@ impl Mint {
         Ok(quote.payment_method)
     }
 
+    /// Settles a held mint quote with the preimage of its payment hash
+    ///
+    /// The payment processor verifies the preimage, persists it and settles the
+    /// held HTLCs. The quote is then re-checked synchronously so that the
+    /// response carries the settled amount, and the payment is recorded through
+    /// the regular paid-quote path, which is idempotent on the payment id.
+    ///
+    /// # Arguments
+    /// * `method` - Payment method the quote was created for
+    /// * `quote_id` - Quote to settle
+    /// * `preimage` - Hex encoded preimage of the quote payment hash
+    ///
+    /// # Returns
+    /// * `MintQuoteResponse<QuoteId>` - The quote after settlement
+    /// * `Error` if the quote is unknown, the method differs, or the processor
+    ///   rejects the preimage, the hold state or the settle deadline
+    #[instrument(skip_all)]
+    pub async fn settle_mint_quote(
+        &self,
+        method: &PaymentMethod,
+        quote_id: &QuoteId,
+        preimage: &str,
+    ) -> Result<MintQuoteResponse<QuoteId>, Error> {
+        #[cfg(feature = "prometheus")]
+        let metrics = super::MintMetricGuard::new("settle_mint_quote");
+
+        let result = async {
+            let quote = self
+                .localstore
+                .get_mint_quote(quote_id)
+                .await?
+                .ok_or(Error::UnknownQuote)?;
+
+            ensure_cdk!(&quote.payment_method == method, Error::InvalidPaymentMethod);
+
+            let payment_backend =
+                self.get_payment_processor(quote.unit.clone(), quote.payment_method.clone())?;
+
+            let settle_response = payment_backend
+                .settle_incoming_payment(&method.to_string(), &quote.request_lookup_id, preimage)
+                .await?;
+
+            if let Some(extra) = settle_response.extra_json {
+                let mut tx = self.localstore.begin_transaction().await?;
+                let mut quote = tx
+                    .get_mint_quote(quote_id)
+                    .await?
+                    .ok_or(Error::UnknownQuote)?;
+
+                if quote.merge_extra(extra) {
+                    let updated_at = tx.update_mint_quote_extra(&mut quote).await?;
+                    quote.set_updated_at(updated_at);
+                }
+
+                tx.commit().await?;
+            }
+
+            for payment in payment_backend
+                .check_incoming_payment_status(&quote.request_lookup_id)
+                .await?
+            {
+                self.pay_mint_quote_for_request_id(payment).await?;
+            }
+
+            let quote = self
+                .localstore
+                .get_mint_quote(quote_id)
+                .await?
+                .ok_or(Error::UnknownQuote)?;
+
+            quote.try_into()
+        }
+        .await;
+
+        #[cfg(feature = "prometheus")]
+        {
+            metrics.record(result.is_ok());
+        }
+
+        result
+    }
+
     /// Checks the status of multiple mint quotes (NUT-29 batch quote check)
     ///
     /// Validates that all quotes exist and returns their current states.

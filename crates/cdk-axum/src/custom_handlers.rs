@@ -11,7 +11,7 @@ use axum::extract::{FromRequestParts, Json, Path, State};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use cdk::mint::QuoteId;
+use cdk::mint::{MintQuoteResponse, QuoteId};
 use cdk::nuts::nut21::{Method, ProtectedEndpoint, RoutePath};
 use cdk::nuts::{
     BatchCheckMintQuoteRequest, BatchMintRequest, MeltOnchainRequest, MeltQuoteBolt11Request,
@@ -21,6 +21,7 @@ use cdk::nuts::{
     MintQuoteOnchainResponse, MintRequest, MintResponse, PaymentMethod,
 };
 use cdk::{MeltQuoteCreateResponse, MeltQuoteResponse};
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::instrument;
 
@@ -362,6 +363,46 @@ pub async fn get_check_mint_custom_quote(
                 _ => Err(into_response(cdk::Error::InvalidPaymentMethod)),
             }
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct SettleMintQuoteRequest {
+    preimage: String,
+}
+
+/// Settle a held custom payment method mint quote with the preimage of its
+/// payment hash
+#[instrument(skip_all, fields(method = ?method, quote_id = ?quote_id))]
+pub async fn post_settle_mint_custom_quote(
+    auth: AuthHeader,
+    State(state): State<MintState>,
+    Path((method, quote_id)): Path<(String, QuoteId)>,
+    Json(payload): Json<Value>,
+) -> Result<Response, Response> {
+    state
+        .mint
+        .verify_auth(
+            auth.into(),
+            &ProtectedEndpoint::new(Method::Post, RoutePath::MintQuote(method.clone())),
+        )
+        .await
+        .map_err(into_response)?;
+
+    let request: SettleMintQuoteRequest = serde_json::from_value(payload).map_err(|e| {
+        tracing::error!("Failed to parse settle request: {}", e);
+        into_response(cdk::Error::InvalidPaymentMethod)
+    })?;
+
+    let quote_response = state
+        .mint
+        .settle_mint_quote(&PaymentMethod::from(method), &quote_id, &request.preimage)
+        .await
+        .map_err(into_response)?;
+
+    match quote_response {
+        MintQuoteResponse::Custom { response, .. } => Ok(Json(response).into_response()),
+        _ => Err(into_response(cdk::Error::InvalidPaymentMethod)),
     }
 }
 
@@ -776,17 +817,26 @@ pub async fn cache_post_batch_mint(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
+    use async_trait::async_trait;
     use axum::http::{HeaderValue, Request, StatusCode};
     use bip39::Mnemonic;
+    use cdk::cdk_payment::{
+        self, CreateIncomingPaymentResponse, Event, IncomingPaymentOptions, MakePaymentResponse,
+        MintPayment, OutgoingPaymentOptions, PaymentIdentifier, PaymentQuoteResponse,
+        SettingsResponse, SettleIncomingPaymentResponse, WaitPaymentResponse,
+    };
     use cdk::mint::{MintBuilder, MintMeltLimits, MintQuoteResponse};
     use cdk::nuts::nut00::KnownMethod;
     use cdk::nuts::{BlindedMessage, CurrencyUnit, MintQuoteState, PaymentMethod, SecretKey};
     use cdk::types::{FeeReserve, QuoteTTL};
     use cdk::Amount;
     use cdk_fake_wallet::FakeWallet;
+    use futures::Stream;
 
     use super::*;
     use crate::cache::HttpCache;
@@ -1300,5 +1350,330 @@ mod tests {
             paypal_quote_created,
             "mixed-case body method should create a quote under the normalized payment method"
         );
+    }
+
+    const HOLD_METHOD: &str = "bolt11_hold";
+    const HOLD_LOOKUP_ID: &str = "hold-lookup-id";
+    const HOLD_AMOUNT_SAT: u64 = 21;
+    const HOLD_SETTLE_DEADLINE: u64 = 870_420;
+    const HOLD_PAYMENT_HASH: &str =
+        "ec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc5";
+    const HOLD_PREIMAGE: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[derive(Debug, Clone, Copy)]
+    enum SettleBehavior {
+        Settle,
+        SettlePending,
+        PreimageMismatch,
+        NotHeld,
+        Cancelled,
+        DeadlinePassed,
+    }
+
+    fn settled_hold_extra() -> Value {
+        serde_json::json!({
+            "hold_state": "SETTLED",
+            "settle_deadline": HOLD_SETTLE_DEADLINE,
+        })
+    }
+
+    struct HoldBackend {
+        behavior: SettleBehavior,
+        settled: Arc<AtomicBool>,
+    }
+
+    impl HoldBackend {
+        fn new(behavior: SettleBehavior) -> Self {
+            Self {
+                behavior,
+                settled: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MintPayment for HoldBackend {
+        type Err = cdk_payment::Error;
+
+        async fn get_settings(&self) -> Result<SettingsResponse, Self::Err> {
+            Ok(SettingsResponse {
+                unit: CurrencyUnit::Sat.to_string(),
+                bolt11: None,
+                bolt12: None,
+                onchain: None,
+                custom: HashMap::from([(HOLD_METHOD.to_string(), "{}".to_string())]),
+            })
+        }
+
+        async fn create_incoming_payment_request(
+            &self,
+            options: IncomingPaymentOptions,
+        ) -> Result<CreateIncomingPaymentResponse, Self::Err> {
+            match options {
+                IncomingPaymentOptions::Custom(_) => Ok(CreateIncomingPaymentResponse {
+                    request_lookup_id: PaymentIdentifier::CustomId(HOLD_LOOKUP_ID.to_string()),
+                    request: "bolt11-hold-request".to_string(),
+                    expiry: Some(10_000),
+                    extra_json: Some(serde_json::json!({
+                        "payment_hash": HOLD_PAYMENT_HASH,
+                        "min_final_cltv_expiry_delta": 432,
+                        "hold_state": "UNPAID",
+                        "settle_deadline": null,
+                    })),
+                }),
+                _ => Err(cdk_payment::Error::UnsupportedPaymentOption),
+            }
+        }
+
+        async fn get_payment_quote(
+            &self,
+            _unit: &CurrencyUnit,
+            _options: OutgoingPaymentOptions,
+        ) -> Result<PaymentQuoteResponse, Self::Err> {
+            Err(cdk_payment::Error::UnsupportedPaymentOption)
+        }
+
+        async fn make_payment(
+            &self,
+            _unit: &CurrencyUnit,
+            _options: OutgoingPaymentOptions,
+        ) -> Result<MakePaymentResponse, Self::Err> {
+            Err(cdk_payment::Error::UnsupportedPaymentOption)
+        }
+
+        async fn wait_payment_event(
+            &self,
+        ) -> Result<Pin<Box<dyn Stream<Item = Event> + Send>>, Self::Err> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn is_payment_event_stream_active(&self) -> bool {
+            false
+        }
+
+        fn cancel_payment_event_stream(&self) {}
+
+        async fn check_incoming_payment_status(
+            &self,
+            payment_identifier: &PaymentIdentifier,
+        ) -> Result<Vec<WaitPaymentResponse>, Self::Err> {
+            if !self.settled.load(Ordering::SeqCst) {
+                return Ok(Vec::new());
+            }
+
+            Ok(vec![WaitPaymentResponse {
+                payment_identifier: payment_identifier.clone(),
+                payment_amount: Amount::new(HOLD_AMOUNT_SAT * 1_000, CurrencyUnit::Msat),
+                payment_id: "hold-payment-id".to_string(),
+            }])
+        }
+
+        async fn settle_incoming_payment(
+            &self,
+            method: &str,
+            payment_identifier: &PaymentIdentifier,
+            _preimage: &str,
+        ) -> Result<SettleIncomingPaymentResponse, Self::Err> {
+            if method != HOLD_METHOD {
+                return Err(cdk_payment::Error::UnsupportedPaymentOption);
+            }
+
+            match self.behavior {
+                SettleBehavior::Settle => {
+                    self.settled.store(true, Ordering::SeqCst);
+
+                    Ok(SettleIncomingPaymentResponse {
+                        request_lookup_id: payment_identifier.clone(),
+                        state: MintQuoteState::Paid,
+                        extra_json: Some(settled_hold_extra()),
+                    })
+                }
+                SettleBehavior::SettlePending => Ok(SettleIncomingPaymentResponse {
+                    request_lookup_id: payment_identifier.clone(),
+                    state: MintQuoteState::Unpaid,
+                    extra_json: Some(serde_json::json!({
+                        "hold_state": "HELD",
+                        "settle_deadline": HOLD_SETTLE_DEADLINE,
+                    })),
+                }),
+                SettleBehavior::PreimageMismatch => Err(cdk_payment::Error::PreimageMismatch),
+                SettleBehavior::NotHeld => Err(cdk_payment::Error::HoldNotHeld),
+                SettleBehavior::Cancelled => Err(cdk_payment::Error::HoldCancelled),
+                SettleBehavior::DeadlinePassed => Err(cdk_payment::Error::SettleDeadlinePassed),
+            }
+        }
+
+        async fn check_outgoing_payment(
+            &self,
+            _payment_identifier: &PaymentIdentifier,
+        ) -> Result<MakePaymentResponse, Self::Err> {
+            Err(cdk_payment::Error::UnsupportedPaymentOption)
+        }
+    }
+
+    async fn create_test_state_with_hold_backend(behavior: SettleBehavior) -> MintState {
+        let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
+        let mut builder = MintBuilder::new(db.clone());
+
+        builder
+            .add_payment_processor(
+                CurrencyUnit::Sat,
+                PaymentMethod::Custom(HOLD_METHOD.to_string()),
+                MintMeltLimits::new(1, 10_000),
+                Arc::new(HoldBackend::new(behavior)),
+            )
+            .await
+            .unwrap();
+
+        let mnemonic = Mnemonic::generate(12).unwrap();
+        let mint = builder
+            .build_with_seed(db, &mnemonic.to_seed_normalized(""))
+            .await
+            .unwrap();
+        mint.set_quote_ttl(QuoteTTL::new(10_000, 10_000))
+            .await
+            .unwrap();
+        mint.start().await.unwrap();
+
+        MintState {
+            mint: Arc::new(mint),
+            cache: Arc::new(HttpCache::default()),
+        }
+    }
+
+    async fn settle_hold_quote(
+        behavior: SettleBehavior,
+        method: &str,
+    ) -> Result<Response, Response> {
+        let state = create_test_state_with_hold_backend(behavior).await;
+        let quote_id = create_custom_quote(&state, HOLD_METHOD, HOLD_AMOUNT_SAT).await;
+
+        post_settle_mint_custom_quote(
+            AuthHeader::None,
+            State(state),
+            Path((method.to_string(), quote_id)),
+            Json(serde_json::json!({ "preimage": HOLD_PREIMAGE })),
+        )
+        .await
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn post_settle_mint_custom_quote_returns_settled_quote() {
+        let response = settle_hold_quote(SettleBehavior::Settle, HOLD_METHOD)
+            .await
+            .expect("settling a held quote must succeed");
+
+        let value = response_json(response).await;
+
+        assert!(!value["quote"].as_str().unwrap().is_empty());
+        assert_eq!(value["amount_paid"].as_u64(), Some(HOLD_AMOUNT_SAT));
+        assert_eq!(value["amount_issued"].as_u64(), Some(0));
+        assert_eq!(value["hold_state"].as_str(), Some("SETTLED"));
+        assert_eq!(value["payment_hash"].as_str(), Some(HOLD_PAYMENT_HASH));
+        assert_eq!(
+            value["settle_deadline"].as_u64(),
+            Some(HOLD_SETTLE_DEADLINE)
+        );
+    }
+
+    #[tokio::test]
+    async fn post_settle_mint_custom_quote_does_not_credit_unsettled_settle() {
+        let response = settle_hold_quote(SettleBehavior::SettlePending, HOLD_METHOD)
+            .await
+            .expect("an accepted preimage that has not settled yet must return the quote");
+
+        let value = response_json(response).await;
+
+        assert_eq!(value["amount_paid"].as_u64(), Some(0));
+        assert_eq!(value["amount_issued"].as_u64(), Some(0));
+        assert_eq!(value["hold_state"].as_str(), Some("HELD"));
+        assert_eq!(value["payment_hash"].as_str(), Some(HOLD_PAYMENT_HASH));
+    }
+
+    #[tokio::test]
+    async fn create_custom_routers_registers_settle_route() {
+        let state = create_test_state_with_hold_backend(SettleBehavior::Settle).await;
+
+        let _router =
+            crate::custom_router::create_custom_routers(state, vec![HOLD_METHOD.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn post_settle_mint_custom_quote_is_idempotent() {
+        let state = create_test_state_with_hold_backend(SettleBehavior::Settle).await;
+        let quote_id = create_custom_quote(&state, HOLD_METHOD, HOLD_AMOUNT_SAT).await;
+
+        for _ in 0..2 {
+            let response = post_settle_mint_custom_quote(
+                AuthHeader::None,
+                State(state.clone()),
+                Path((HOLD_METHOD.to_string(), quote_id.clone())),
+                Json(serde_json::json!({ "preimage": HOLD_PREIMAGE })),
+            )
+            .await
+            .expect("repeating a settle with the correct preimage must return the quote");
+
+            let value = response_json(response).await;
+
+            assert_eq!(value["amount_paid"].as_u64(), Some(HOLD_AMOUNT_SAT));
+            assert_eq!(value["amount_issued"].as_u64(), Some(0));
+        }
+    }
+
+    #[tokio::test]
+    async fn post_settle_mint_custom_quote_maps_settle_rejections_to_nutxx_codes() {
+        for (behavior, expected_code) in [
+            (SettleBehavior::PreimageMismatch, 20011),
+            (SettleBehavior::NotHeld, 20012),
+            (SettleBehavior::Cancelled, 20013),
+            (SettleBehavior::DeadlinePassed, 20014),
+        ] {
+            let response = settle_hold_quote(behavior, HOLD_METHOD)
+                .await
+                .expect_err("a rejected settle must not return a quote");
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+            let value = response_json(response).await;
+            assert_eq!(
+                value["code"].as_u64(),
+                Some(expected_code),
+                "unexpected code for {:?}",
+                behavior
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn post_settle_mint_custom_quote_rejects_other_method() {
+        let response = settle_hold_quote(SettleBehavior::Settle, "venmo")
+            .await
+            .expect_err("a quote must not be settled through another method");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_settle_mint_custom_quote_rejects_unknown_quote() {
+        let state = create_test_state_with_hold_backend(SettleBehavior::Settle).await;
+
+        let response = post_settle_mint_custom_quote(
+            AuthHeader::None,
+            State(state),
+            Path((HOLD_METHOD.to_string(), QuoteId::new())),
+            Json(serde_json::json!({ "preimage": HOLD_PREIMAGE })),
+        )
+        .await
+        .expect_err("an unknown quote must not be settled");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

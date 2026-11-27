@@ -150,6 +150,53 @@ where
     );
 }
 
+/// Persist the payment-method-specific extra of a mint quote
+pub async fn update_mint_quote_extra<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let mint_quote = MintQuote::new(
+        None,
+        unique_string(),
+        cashu::CurrencyUnit::Sat,
+        None,
+        0,
+        PaymentIdentifier::CustomId(unique_string()),
+        None,
+        Amount::new(0, cashu::CurrencyUnit::Sat),
+        Amount::new(0, cashu::CurrencyUnit::Sat),
+        cashu::PaymentMethod::Custom("bolt11_hold".to_string()),
+        0,
+        0,
+        vec![],
+        vec![],
+        Some(serde_json::json!({"hold_state": "UNPAID"})),
+    );
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let mut mint_quote = tx.add_mint_quote(mint_quote).await.unwrap();
+    let created_updated_at = mint_quote.updated_at();
+
+    mint_quote.extra_json = Some(serde_json::json!({"hold_state": "SETTLED"}));
+    let updated_at = tx.update_mint_quote_extra(&mut mint_quote).await.unwrap();
+    tx.commit().await.unwrap();
+
+    assert!(updated_at > created_updated_at);
+
+    let stored = db
+        .get_mint_quote(&mint_quote.id)
+        .await
+        .unwrap()
+        .expect("mint_quote_from_db");
+
+    assert_eq!(
+        stored.extra_json,
+        Some(serde_json::json!({"hold_state": "SETTLED"}))
+    );
+    assert_eq!(stored.updated_at(), updated_at);
+    assert_eq!(stored.amount_paid().value(), 0);
+}
+
 /// Read mint and payments from db and tx objects
 pub async fn read_mint_from_db_and_tx<DB>(db: DB)
 where

@@ -999,6 +999,60 @@ where
         Ok(())
     }
 
+    async fn update_mint_quote_extra(
+        &mut self,
+        quote: &mut Acquired<mint::MintQuote>,
+    ) -> Result<u64, Self::Err> {
+        let current_time = unix_time();
+
+        query(
+            r#"
+            UPDATE
+                mint_quote
+            SET
+                extra_json = :extra_json,
+                updated_at = CASE
+                    WHEN :current_time > updated_at + 1 THEN :current_time
+                    ELSE updated_at + 1
+                END
+            WHERE
+                id = :quote_id
+            "#,
+        )?
+        .bind("quote_id", quote.id.to_string())
+        .bind(
+            "extra_json",
+            quote.extra_json.as_ref().map(|value| value.to_string()),
+        )
+        .bind("current_time", current_time as i64)
+        .execute(&self.inner)
+        .await
+        .inspect_err(|err| {
+            tracing::error!("SQL could not update mint quote extra: {}", err);
+        })?;
+
+        let updated_at = query(
+            r#"
+            SELECT updated_at
+            FROM mint_quote
+            WHERE id = :quote_id
+            "#,
+        )?
+        .bind("quote_id", quote.id.to_string())
+        .pluck(&self.inner)
+        .await?
+        .map(|updated_at| Ok::<_, Error>(column_as_number!(updated_at)))
+        .transpose()?
+        .ok_or_else(|| {
+            Error::Internal(format!(
+                "mint quote {} missing after extra update",
+                quote.id
+            ))
+        })?;
+
+        Ok(updated_at)
+    }
+
     #[instrument(skip_all)]
     async fn add_mint_quote(&mut self, quote: MintQuote) -> Result<Acquired<MintQuote>, Self::Err> {
         query(

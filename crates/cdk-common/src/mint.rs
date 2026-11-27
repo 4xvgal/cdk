@@ -718,6 +718,29 @@ impl MintQuote {
         self.updated_at = updated_at;
     }
 
+    /// Shallow-merges payment-method-specific fields into the stored extra
+    ///
+    /// Keys of `update` are inserted or overwritten in the stored extra object.
+    /// When either side is not a JSON object the update replaces the stored
+    /// extra.
+    ///
+    /// Returns `true` when the stored extra changed.
+    pub fn merge_extra(&mut self, update: serde_json::Value) -> bool {
+        let previous = self.extra_json.take();
+        let merged = match (previous.clone(), update) {
+            (Some(serde_json::Value::Object(mut stored)), serde_json::Value::Object(update)) => {
+                stored.extend(update);
+                serde_json::Value::Object(stored)
+            }
+            (_, update) => update,
+        };
+
+        let changed = previous.as_ref() != Some(&merged);
+        self.extra_json = Some(merged);
+
+        changed
+    }
+
     /// Unix timestamp of the most recent payment backend status check.
     pub fn last_checked(&self) -> u64 {
         self.last_checked
@@ -2361,6 +2384,46 @@ mod tests {
             }
             other => panic!("expected Custom variant, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn merge_extra_json_keeps_stored_fields_and_reports_changes() {
+        let mut quote = MintQuote::new(
+            Some(QuoteId::new()),
+            "custom://request".to_string(),
+            CurrencyUnit::Sat,
+            None,
+            unix_time() + 3600,
+            PaymentIdentifier::CustomId("hold".to_string()),
+            None,
+            Amount::new(0, CurrencyUnit::Sat),
+            Amount::new(0, CurrencyUnit::Sat),
+            PaymentMethod::Custom("bolt11_hold".to_string()),
+            unix_time(),
+            unix_time(),
+            Vec::new(),
+            Vec::new(),
+            Some(serde_json::json!({
+                "payment_hash": "abc",
+                "hold_state": "UNPAID",
+            })),
+        );
+
+        assert!(quote.merge_extra(serde_json::json!({
+            "hold_state": "SETTLED",
+            "settle_deadline": 870_420,
+        })));
+
+        assert_eq!(
+            quote.extra_json,
+            Some(serde_json::json!({
+                "payment_hash": "abc",
+                "hold_state": "SETTLED",
+                "settle_deadline": 870_420,
+            }))
+        );
+
+        assert!(!quote.merge_extra(serde_json::json!({ "hold_state": "SETTLED" })));
     }
 
     #[test]

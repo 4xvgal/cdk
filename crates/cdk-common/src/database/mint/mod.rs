@@ -286,6 +286,19 @@ pub trait QuotesTransaction {
         quote: &mut Acquired<mint::MintQuote>,
     ) -> Result<(), Self::Err>;
 
+    /// Persists the payment-method-specific `extra_json` of a mint quote.
+    ///
+    /// The extra carries fields such as the hold state and the settle deadline of
+    /// a `bolt11_hold` quote. Implementations bump `updated_at` because those
+    /// fields changing is a change of the quote and return the stored value.
+    ///
+    /// Requires an [`Acquired`] mint quote to ensure the row is locked before
+    /// modification.
+    async fn update_mint_quote_extra(
+        &mut self,
+        quote: &mut Acquired<mint::MintQuote>,
+    ) -> Result<u64, Self::Err>;
+
     /// Get [`mint::MeltQuote`] and lock it for update in this transaction
     async fn get_melt_quote(
         &mut self,

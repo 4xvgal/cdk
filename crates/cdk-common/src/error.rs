@@ -689,6 +689,47 @@ mod tests {
         assert_eq!(response.detail, "Payment backend error");
         assert!(!response.detail.contains(BACKEND_DETAIL));
     }
+
+    #[cfg(feature = "mint")]
+    #[test]
+    fn hold_settle_errors_use_nutxx_error_codes() {
+        for (error, code, expected_code) in [
+            (
+                crate::payment::Error::PreimageMismatch,
+                ErrorCode::PreimageMismatch,
+                20011,
+            ),
+            (
+                crate::payment::Error::HoldNotHeld,
+                ErrorCode::QuoteNotHeld,
+                20012,
+            ),
+            (
+                crate::payment::Error::HoldCancelled,
+                ErrorCode::QuoteCancelled,
+                20013,
+            ),
+            (
+                crate::payment::Error::SettleDeadlinePassed,
+                ErrorCode::SettleDeadlinePassed,
+                20014,
+            ),
+        ] {
+            let response = ErrorResponse::from(Error::Payment(error));
+
+            assert_eq!(response.code, code);
+            assert_eq!(response.code.to_code(), expected_code);
+            assert_eq!(ErrorCode::from_code(expected_code), code);
+        }
+
+        assert_eq!(ErrorCode::PaymentHashAlreadyUsed.to_code(), 20015);
+        assert_eq!(ErrorCode::InvalidCltvDelta.to_code(), 20016);
+        assert_eq!(
+            ErrorCode::from_code(20015),
+            ErrorCode::PaymentHashAlreadyUsed
+        );
+        assert_eq!(ErrorCode::from_code(20016), ErrorCode::InvalidCltvDelta);
+    }
 }
 
 impl Error {
@@ -1137,6 +1178,26 @@ impl From<Error> for ErrorResponse {
                 detail: err.to_string(),
             },
             #[cfg(feature = "mint")]
+            Error::Payment(crate::payment::Error::PreimageMismatch) => ErrorResponse {
+                code: ErrorCode::PreimageMismatch,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "mint")]
+            Error::Payment(crate::payment::Error::HoldNotHeld) => ErrorResponse {
+                code: ErrorCode::QuoteNotHeld,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "mint")]
+            Error::Payment(crate::payment::Error::HoldCancelled) => ErrorResponse {
+                code: ErrorCode::QuoteCancelled,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "mint")]
+            Error::Payment(crate::payment::Error::SettleDeadlinePassed) => ErrorResponse {
+                code: ErrorCode::SettleDeadlinePassed,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "mint")]
             Error::Payment(payment_error) => {
                 tracing::error!(error = %payment_error, "Payment backend error");
                 ErrorResponse {
@@ -1285,6 +1346,16 @@ impl From<ErrorResponse> for Error {
             ErrorCode::QuoteExpired => Self::ExpiredQuote(0, 0),
             ErrorCode::WitnessMissingOrInvalid => Self::SignatureMissingOrInvalid,
             ErrorCode::PubkeyRequired => Self::PubkeyRequired,
+            #[cfg(feature = "mint")]
+            ErrorCode::PreimageMismatch => Self::Payment(crate::payment::Error::PreimageMismatch),
+            #[cfg(feature = "mint")]
+            ErrorCode::QuoteNotHeld => Self::Payment(crate::payment::Error::HoldNotHeld),
+            #[cfg(feature = "mint")]
+            ErrorCode::QuoteCancelled => Self::Payment(crate::payment::Error::HoldCancelled),
+            #[cfg(feature = "mint")]
+            ErrorCode::SettleDeadlinePassed => {
+                Self::Payment(crate::payment::Error::SettleDeadlinePassed)
+            }
             // 30xxx - Clear auth errors
             ErrorCode::ClearAuthRequired => Self::ClearAuthRequired,
             ErrorCode::ClearAuthFailed => Self::ClearAuthFailed,
@@ -1379,6 +1450,18 @@ pub enum ErrorCode {
     WitnessMissingOrInvalid,
     /// Pubkey required for mint quote (20009)
     PubkeyRequired,
+    /// Preimage does not match payment hash (20011)
+    PreimageMismatch,
+    /// Held quote is not held (20012)
+    QuoteNotHeld,
+    /// Held quote is cancelled (20013)
+    QuoteCancelled,
+    /// Settle deadline has passed (20014)
+    SettleDeadlinePassed,
+    /// Payment hash already used (20015)
+    PaymentHashAlreadyUsed,
+    /// Final CLTV expiry delta outside of allowed range (20016)
+    InvalidCltvDelta,
 
     // 30xxx - Clear auth errors
     /// Endpoint requires clear auth (30001)
@@ -1441,6 +1524,12 @@ impl ErrorCode {
             20007 => Self::QuoteExpired,
             20008 => Self::WitnessMissingOrInvalid,
             20009 => Self::PubkeyRequired,
+            20011 => Self::PreimageMismatch,
+            20012 => Self::QuoteNotHeld,
+            20013 => Self::QuoteCancelled,
+            20014 => Self::SettleDeadlinePassed,
+            20015 => Self::PaymentHashAlreadyUsed,
+            20016 => Self::InvalidCltvDelta,
             // 30xxx - Clear auth errors
             30001 => Self::ClearAuthRequired,
             30002 => Self::ClearAuthFailed,
@@ -1490,6 +1579,12 @@ impl ErrorCode {
             Self::QuoteExpired => 20007,
             Self::WitnessMissingOrInvalid => 20008,
             Self::PubkeyRequired => 20009,
+            Self::PreimageMismatch => 20011,
+            Self::QuoteNotHeld => 20012,
+            Self::QuoteCancelled => 20013,
+            Self::SettleDeadlinePassed => 20014,
+            Self::PaymentHashAlreadyUsed => 20015,
+            Self::InvalidCltvDelta => 20016,
             // 30xxx - Clear auth errors
             Self::ClearAuthRequired => 30001,
             Self::ClearAuthFailed => 30002,
