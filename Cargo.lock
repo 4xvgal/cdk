@@ -1623,6 +1623,7 @@ dependencies = [
  "cdk-common",
  "cdk-lnd",
  "futures",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

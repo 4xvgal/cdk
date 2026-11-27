@@ -9,19 +9,23 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cdk_common::bitcoin::hashes::Hash;
+use cdk_common::bitcoin::hashes::{sha256, Hash};
 use cdk_common::payment::{
     self, CreateIncomingPaymentResponse, Event, IncomingPaymentOptions, MakePaymentResponse,
     MintPayment, OutgoingPaymentOptions, PaymentIdentifier, PaymentQuoteResponse, SettingsResponse,
-    WaitPaymentResponse,
+    SettleIncomingPaymentResponse, WaitPaymentResponse,
 };
 use cdk_common::util::hex;
-use cdk_common::{Amount, Bolt11Invoice, CurrencyUnit};
+use cdk_common::{Amount, Bolt11Invoice, CurrencyUnit, MintQuoteState};
 use cdk_lnd::{client, invoicesrpc, lnrpc};
 use futures::{Stream, StreamExt};
-use hold::{follow_action, FollowAction, HoldState, HoldStatus, HoldTracker};
+use hold::{
+    follow_action, settle_decision, FollowAction, HoldRecord, HoldState, HoldStatus, HoldTracker,
+    SettleDecision,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use store::SettleStore;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request};
@@ -34,10 +38,14 @@ use tracing::instrument;
 /// module has no I/O.
 pub mod hold;
 
+/// SQLite store of the preimages and hold states of this processor
+pub mod store;
+
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 const RECOVERY_PAGE_SIZE: u64 = 1_000;
 const BLOCK_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SUBSCRIPTION_RETRY_DELAY: Duration = Duration::from_secs(5);
+const SETTLE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Custom payment method served by this backend
 pub const METHOD: &str = "bolt11_hold";
@@ -65,6 +73,8 @@ pub struct Settings {
     pub max_pending_quotes: u32,
     /// Hold invoice expiry in seconds
     pub invoice_expiry_secs: i32,
+    /// SQLite file holding the persisted preimages and hold states
+    pub settle_db_path: PathBuf,
 }
 
 impl Default for Settings {
@@ -79,6 +89,7 @@ impl Default for Settings {
             lnd_hold_expiry_delta: 18,
             max_pending_quotes: 100,
             invoice_expiry_secs: 3600,
+            settle_db_path: PathBuf::from("cdk-lnd-hold-settle.sqlite"),
         }
     }
 }
@@ -180,6 +191,37 @@ fn payment_hash_from_identifier(
         .map_err(|_| payment::Error::InvalidHash)
 }
 
+fn parse_preimage(preimage: &str, payment_hash: &[u8; 32]) -> Result<[u8; 32], payment::Error> {
+    let preimage: [u8; 32] = hex::decode(preimage)
+        .map_err(|_| payment::Error::PreimageMismatch)?
+        .try_into()
+        .map_err(|_| payment::Error::PreimageMismatch)?;
+
+    if &sha256::Hash::hash(&preimage).to_byte_array() != payment_hash {
+        return Err(payment::Error::PreimageMismatch);
+    }
+
+    Ok(preimage)
+}
+
+fn is_already_cancelled(status: &tonic::Status) -> bool {
+    status.message().to_lowercase().contains("already cancel")
+}
+
+fn is_already_settled(status: &tonic::Status) -> bool {
+    status.message().to_lowercase().contains("already settled")
+}
+
+fn settle_extra_json(record: HoldRecord, preimage_persisted: bool) -> Value {
+    let mut extra = record.extra_json();
+
+    if let Value::Object(fields) = &mut extra {
+        fields.insert("preimage_persisted".to_string(), json!(preimage_persisted));
+    }
+
+    extra
+}
+
 fn add_hold_invoice_request(
     request: &HoldInvoiceRequest,
     memo: String,
@@ -224,17 +266,20 @@ impl LndHold {
         .await
         .map_err(|err| invalid(&format!("LND connection error: {err}")))?;
 
+        let store = Arc::new(SettleStore::open(&settings.settle_db_path)?);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
         let watcher = Watcher {
             client,
             tracker: Arc::new(HoldTracker::new(settings.settle_margin_blocks)),
+            store,
             events,
             watched: Arc::new(Mutex::new(HashSet::new())),
         };
 
         tokio::spawn(poll_block_height(watcher.clone()));
         tokio::spawn(recover_pending_invoices(watcher.clone()));
+        tokio::spawn(resume_pending_settles(watcher.clone()));
 
         Ok(Self {
             settings,
@@ -249,6 +294,7 @@ impl LndHold {
 struct Watcher {
     client: client::Client,
     tracker: Arc<HoldTracker>,
+    store: Arc<SettleStore>,
     events: broadcast::Sender<WaitPaymentResponse>,
     watched: Arc<Mutex<HashSet<[u8; 32]>>>,
 }
@@ -273,6 +319,52 @@ impl Watcher {
             Err(status) if status.code() == Code::NotFound => Ok(None),
             Err(status) => Err(invalid(&format!("LND LookupInvoice failed: {status}"))),
         }
+    }
+
+    async fn record(&self, payment_hash: &[u8; 32]) -> Result<HoldRecord, payment::Error> {
+        Ok(match self.lookup_invoice(payment_hash).await? {
+            Some(invoice) => self
+                .tracker
+                .observe(payment_hash, HoldStatus::from_invoice(&invoice)),
+            None => match self.tracker.get(payment_hash) {
+                Some(record) => record,
+                None => self.tracker.observe(payment_hash, HoldStatus::unpaid()),
+            },
+        })
+    }
+
+    async fn block_height(&self) -> Result<u32, payment::Error> {
+        let mut client = self.client.clone();
+
+        client
+            .lightning()
+            .get_info(Request::new(lnrpc::GetInfoRequest {}))
+            .await
+            .map(|response| response.into_inner().block_height)
+            .map_err(|status| invalid(&format!("LND GetInfo failed: {status}")))
+    }
+
+    async fn settle_invoice(&self, preimage: &[u8; 32]) -> Result<(), tonic::Status> {
+        let request = invoicesrpc::SettleInvoiceMsg {
+            preimage: preimage.to_vec(),
+        };
+
+        self.client
+            .clone()
+            .invoices()
+            .settle_invoice(Request::new(request))
+            .await
+            .map(|_| ())
+    }
+
+    fn mark_settled(&self, payment_hash: &[u8; 32]) -> Result<(), payment::Error> {
+        self.tracker.mark_settled(payment_hash);
+        self.store.set_state(payment_hash, HoldState::Settled)
+    }
+
+    fn mark_cancelled(&self, payment_hash: &[u8; 32]) -> Result<(), payment::Error> {
+        self.tracker.mark_cancelled(payment_hash);
+        self.store.set_state(payment_hash, HoldState::Cancelled)
     }
 
     fn ensure_watching(&self, payment_hash: &[u8; 32]) {
@@ -453,23 +545,28 @@ async fn poll_block_height(watcher: Watcher) {
             continue;
         }
 
-        let block_height = match client
-            .lightning()
-            .get_info(Request::new(lnrpc::GetInfoRequest {}))
-            .await
-        {
-            Ok(response) => response.into_inner().block_height,
-            Err(status) => {
-                tracing::warn!(
-                    error = %status,
-                    "LND GetInfo failed; skipping the cancel round",
-                );
+        let block_height = match watcher.block_height().await {
+            Ok(block_height) => block_height,
+            Err(err) => {
+                tracing::warn!(error = %err, "LND GetInfo failed; skipping the cancel round");
                 continue;
             }
         };
 
         for (payment_hash, record) in held {
-            if !record.should_cancel(block_height) {
+            let preimage_persisted = match watcher.store.preimage(&payment_hash) {
+                Ok(preimage) => preimage.is_some(),
+                Err(err) => {
+                    tracing::warn!(
+                        payment_hash = %hex::encode(payment_hash),
+                        error = %err,
+                        "could not read the persisted preimage; skipping the cancel round",
+                    );
+                    continue;
+                }
+            };
+
+            if !hold::should_cancel(record, preimage_persisted, block_height) {
                 continue;
             }
 
@@ -483,7 +580,9 @@ async fn poll_block_height(watcher: Watcher) {
                 .await
             {
                 Ok(_) => {
-                    watcher.tracker.mark_cancelled(&payment_hash);
+                    if let Err(err) = watcher.mark_cancelled(&payment_hash) {
+                        tracing::warn!(error = %err, "could not persist the cancelled hold state");
+                    }
                     tracing::info!(
                         payment_hash = %hex::encode(payment_hash),
                         block_height,
@@ -501,6 +600,94 @@ async fn poll_block_height(watcher: Watcher) {
                 }
             }
         }
+    }
+}
+
+async fn settle_until_settled(watcher: Watcher, payment_hash: [u8; 32], preimage: [u8; 32]) {
+    loop {
+        match watcher.settle_invoice(&preimage).await {
+            Ok(()) => {
+                if let Err(err) = watcher.mark_settled(&payment_hash) {
+                    tracing::warn!(error = %err, "could not persist the settled hold state");
+                }
+
+                tracing::info!(
+                    payment_hash = %hex::encode(payment_hash),
+                    "LND hold invoice settled with the persisted preimage",
+                );
+                return;
+            }
+            Err(status) if is_already_settled(&status) => {
+                if let Err(err) = watcher.mark_settled(&payment_hash) {
+                    tracing::warn!(error = %err, "could not persist the settled hold state");
+                }
+
+                tracing::info!(
+                    payment_hash = %hex::encode(payment_hash),
+                    "LND hold invoice was already settled",
+                );
+                return;
+            }
+            Err(status) if is_already_cancelled(&status) => {
+                if let Err(err) = watcher.mark_cancelled(&payment_hash) {
+                    tracing::warn!(error = %err, "could not persist the cancelled hold state");
+                }
+
+                tracing::warn!(
+                    payment_hash = %hex::encode(payment_hash),
+                    error = %status,
+                    "LND hold invoice was already cancelled; not settling",
+                );
+                return;
+            }
+            Err(status) if status.code() == Code::NotFound => {
+                if let Err(err) = watcher.mark_cancelled(&payment_hash) {
+                    tracing::warn!(error = %err, "could not persist the cancelled hold state");
+                }
+
+                tracing::warn!(
+                    payment_hash = %hex::encode(payment_hash),
+                    "LND does not know the hold invoice; stopping the settle retry",
+                );
+                return;
+            }
+            Err(status) => {
+                tracing::warn!(
+                    payment_hash = %hex::encode(payment_hash),
+                    error = %status,
+                    "LND SettleInvoice failed; retrying",
+                );
+                tokio::time::sleep(SETTLE_RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+async fn resume_pending_settles(watcher: Watcher) {
+    let records = loop {
+        match watcher.store.pending_settles() {
+            Ok(records) => break records,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not read the pending settles; retrying the resume",
+                );
+                tokio::time::sleep(SUBSCRIPTION_RETRY_DELAY).await;
+            }
+        }
+    };
+
+    for record in records {
+        tracing::info!(
+            payment_hash = %hex::encode(record.payment_hash),
+            "resuming the settle retry of a persisted preimage",
+        );
+        watcher.ensure_watching(&record.payment_hash);
+        tokio::spawn(settle_until_settled(
+            watcher.clone(),
+            record.payment_hash,
+            record.preimage,
+        ));
     }
 }
 
@@ -678,18 +865,87 @@ impl MintPayment for LndHold {
         let payment_hash = payment_hash_from_identifier(payment_identifier)?;
         self.watcher.ensure_watching(&payment_hash);
 
-        let record = match self.watcher.lookup_invoice(&payment_hash).await? {
-            Some(invoice) => self
-                .watcher
-                .tracker
-                .observe(&payment_hash, HoldStatus::from_invoice(&invoice)),
-            None => self
-                .watcher
-                .tracker
-                .observe(&payment_hash, HoldStatus::unpaid()),
+        Ok(Some(self.watcher.record(&payment_hash).await?.extra_json()))
+    }
+
+    #[instrument(skip(self))]
+    async fn settle_incoming_payment(
+        &self,
+        method: &str,
+        payment_identifier: &PaymentIdentifier,
+        preimage: &str,
+    ) -> Result<SettleIncomingPaymentResponse, Self::Err> {
+        if method != METHOD {
+            return Err(payment::Error::UnsupportedPaymentOption);
+        }
+
+        let payment_hash = payment_hash_from_identifier(payment_identifier)?;
+        let preimage = parse_preimage(preimage, &payment_hash)?;
+
+        self.watcher.ensure_watching(&payment_hash);
+
+        let record = self.watcher.record(&payment_hash).await?;
+        let preimage_persisted = self.watcher.store.preimage(&payment_hash)?.is_some();
+        let block_height = if record.state == HoldState::Held {
+            Some(self.watcher.block_height().await?)
+        } else {
+            None
         };
 
-        Ok(Some(record.extra_json()))
+        let state = match settle_decision(record, preimage_persisted, block_height)? {
+            SettleDecision::AlreadySettled => {
+                self.watcher.mark_settled(&payment_hash)?;
+                MintQuoteState::Paid
+            }
+            SettleDecision::Settle => {
+                self.watcher
+                    .store
+                    .persist_preimage(&payment_hash, &preimage, HoldState::Held)?;
+
+                match self.watcher.settle_invoice(&preimage).await {
+                    Ok(()) => {
+                        self.watcher.mark_settled(&payment_hash)?;
+                        MintQuoteState::Paid
+                    }
+                    Err(status) if is_already_settled(&status) => {
+                        self.watcher.mark_settled(&payment_hash)?;
+                        MintQuoteState::Paid
+                    }
+                    Err(status) if is_already_cancelled(&status) => {
+                        self.watcher.mark_cancelled(&payment_hash)?;
+                        return Err(payment::Error::HoldCancelled);
+                    }
+                    Err(status) if status.code() == Code::NotFound => {
+                        self.watcher.mark_cancelled(&payment_hash)?;
+                        return Err(payment::Error::HoldNotHeld);
+                    }
+                    Err(status) => {
+                        tracing::warn!(
+                            payment_hash = %hex::encode(payment_hash),
+                            error = %status,
+                            "LND SettleInvoice failed; retrying in the background",
+                        );
+
+                        tokio::spawn(settle_until_settled(
+                            self.watcher.clone(),
+                            payment_hash,
+                            preimage,
+                        ));
+
+                        MintQuoteState::Unpaid
+                    }
+                }
+            }
+        };
+
+        let record = self.watcher.tracker.get(&payment_hash).unwrap_or(record);
+        let preimage_persisted = self.watcher.store.preimage(&payment_hash)?.is_some();
+
+        Ok(SettleIncomingPaymentResponse {
+            request_lookup_id: payment_identifier.clone(),
+            state,
+            extra_json: Some(settle_extra_json(record, preimage_persisted)),
+        })
     }
 
     async fn check_outgoing_payment(
@@ -874,5 +1130,176 @@ mod tests {
             ),
             Err(payment::Error::UnsupportedUnit)
         ));
+    }
+
+    fn preimage_hash(preimage: [u8; 32]) -> [u8; 32] {
+        sha256::Hash::hash(&preimage).to_byte_array()
+    }
+
+    fn record(state: HoldState, settle_deadline: Option<u32>) -> HoldRecord {
+        HoldRecord {
+            state,
+            min_htlc_expiry_height: settle_deadline.map(|deadline| deadline as i32),
+            settle_deadline,
+        }
+    }
+
+    #[test]
+    fn preimage_must_match_the_payment_hash() {
+        let preimage = [1u8; 32];
+        let payment_hash = preimage_hash(preimage);
+
+        assert_eq!(
+            parse_preimage(&hex::encode(preimage), &payment_hash).expect("matching preimage"),
+            preimage
+        );
+
+        for wrong in [
+            hex::encode([2u8; 32]),
+            hex::encode([1u8; 31]),
+            hex::encode([1u8; 33]),
+            "zz".repeat(32),
+            String::new(),
+        ] {
+            assert!(
+                matches!(
+                    parse_preimage(&wrong, &payment_hash),
+                    Err(payment::Error::PreimageMismatch)
+                ),
+                "{wrong}"
+            );
+        }
+    }
+
+    #[test]
+    fn settle_requires_a_held_record() {
+        assert!(matches!(
+            settle_decision(record(HoldState::Unpaid, None), false, None),
+            Err(payment::Error::HoldNotHeld)
+        ));
+        assert!(matches!(
+            settle_decision(record(HoldState::Cancelled, Some(100)), false, None),
+            Err(payment::Error::HoldCancelled)
+        ));
+    }
+
+    #[test]
+    fn settle_accepts_up_to_the_deadline_height() {
+        let held = record(HoldState::Held, Some(100));
+
+        assert_eq!(
+            settle_decision(held, false, Some(99)).ok(),
+            Some(SettleDecision::Settle)
+        );
+        assert_eq!(
+            settle_decision(held, false, Some(100)).ok(),
+            Some(SettleDecision::Settle)
+        );
+        assert!(matches!(
+            settle_decision(held, false, Some(101)),
+            Err(payment::Error::SettleDeadlinePassed)
+        ));
+    }
+
+    #[test]
+    fn settle_of_a_persisted_preimage_is_not_late() {
+        let held = record(HoldState::Held, Some(100));
+
+        assert_eq!(
+            settle_decision(held, true, Some(101)).ok(),
+            Some(SettleDecision::Settle)
+        );
+        assert_eq!(
+            settle_decision(held, true, None).ok(),
+            Some(SettleDecision::Settle)
+        );
+    }
+
+    #[test]
+    fn settle_of_a_settled_record_is_idempotent() {
+        assert_eq!(
+            settle_decision(record(HoldState::Settled, Some(100)), false, Some(101)).ok(),
+            Some(SettleDecision::AlreadySettled)
+        );
+        assert_eq!(
+            settle_decision(record(HoldState::Settled, None), false, None).ok(),
+            Some(SettleDecision::AlreadySettled)
+        );
+    }
+
+    #[test]
+    fn settled_record_reports_settled_and_persisted_preimage() {
+        let store = SettleStore::in_memory().expect("in-memory store");
+        let payment_hash = [7u8; 32];
+        store
+            .persist_preimage(&payment_hash, &[1u8; 32], HoldState::Settled)
+            .expect("persist");
+
+        let extra = settle_extra_json(record(HoldState::Settled, Some(100)), true);
+
+        assert_eq!(extra["hold_state"], "SETTLED");
+        assert_eq!(extra["settle_deadline"], 100);
+        assert_eq!(extra["preimage_persisted"], true);
+        assert_eq!(
+            store.preimage(&payment_hash).expect("read"),
+            Some([1u8; 32])
+        );
+    }
+
+    #[test]
+    fn poller_skips_records_with_a_persisted_preimage() {
+        let held = record(HoldState::Held, Some(100));
+
+        assert!(hold::should_cancel(held, false, 101));
+        assert!(!hold::should_cancel(held, true, 101));
+        assert!(!hold::should_cancel(held, false, 100));
+        assert!(!hold::should_cancel(
+            record(HoldState::Cancelled, Some(100)),
+            false,
+            101
+        ));
+    }
+
+    #[test]
+    fn cancelled_settle_errors_are_recognised() {
+        assert!(is_already_cancelled(&tonic::Status::failed_precondition(
+            "invoice is already canceled"
+        )));
+        assert!(is_already_cancelled(&tonic::Status::failed_precondition(
+            "invoice already cancelled"
+        )));
+        assert!(!is_already_cancelled(&tonic::Status::cancelled(
+            "operation cancelled"
+        )));
+        assert!(!is_already_cancelled(&tonic::Status::not_found(
+            "unable to settle invoice: invoice not found"
+        )));
+        assert!(!is_already_cancelled(&tonic::Status::internal(
+            "connection refused"
+        )));
+    }
+
+    #[test]
+    fn settled_settle_errors_are_recognised() {
+        assert!(is_already_settled(&tonic::Status::failed_precondition(
+            "invoice is already settled"
+        )));
+        assert!(!is_already_settled(&tonic::Status::failed_precondition(
+            "invoice is already canceled"
+        )));
+        assert!(!is_already_settled(&tonic::Status::cancelled(
+            "operation cancelled"
+        )));
+        assert!(!is_already_settled(&tonic::Status::internal(
+            "connection refused"
+        )));
+    }
+
+    #[test]
+    fn default_settings_persist_to_a_file() {
+        assert_eq!(
+            Settings::default().settle_db_path,
+            PathBuf::from("cdk-lnd-hold-settle.sqlite")
+        );
     }
 }

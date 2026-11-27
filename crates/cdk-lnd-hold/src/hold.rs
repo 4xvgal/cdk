@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
+use cdk_common::payment;
 use cdk_lnd::lnrpc;
 use serde_json::{json, Value};
 
@@ -151,6 +152,47 @@ pub enum FollowAction {
     Settle,
 }
 
+/// `true` when the held HTLCs must be cancelled
+///
+/// A persisted preimage means the settlement is pending, and NUT-XX forbids
+/// cancelling such HTLCs.
+pub fn should_cancel(record: HoldRecord, preimage_persisted: bool, block_height: u32) -> bool {
+    !preimage_persisted && record.should_cancel(block_height)
+}
+
+/// Outcome of a settle request
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleDecision {
+    /// Settle the held HTLCs with the preimage
+    Settle,
+    /// The HTLCs are already settled, so the request is a no-op
+    AlreadySettled,
+}
+
+/// Decide a settle request, accepting it up to the settle deadline height
+///
+/// A preimage that is already persisted was accepted within the deadline, so
+/// the deadline no longer applies and the HTLCs must be settled.
+pub fn settle_decision(
+    record: HoldRecord,
+    preimage_persisted: bool,
+    block_height: Option<u32>,
+) -> Result<SettleDecision, payment::Error> {
+    match record.state {
+        HoldState::Settled => Ok(SettleDecision::AlreadySettled),
+        HoldState::Cancelled => Err(payment::Error::HoldCancelled),
+        HoldState::Unpaid => Err(payment::Error::HoldNotHeld),
+        HoldState::Held if preimage_persisted => Ok(SettleDecision::Settle),
+        HoldState::Held => match (record.settle_deadline, block_height) {
+            (Some(deadline), Some(height)) if height > deadline => {
+                Err(payment::Error::SettleDeadlinePassed)
+            }
+            (Some(_), None) => Err(payment::Error::UnknownPaymentState),
+            _ => Ok(SettleDecision::Settle),
+        },
+    }
+}
+
 /// Action for a tracked record, reporting a payment only once it is settled
 pub fn follow_action(record: HoldRecord) -> FollowAction {
     match record.state {
@@ -220,6 +262,21 @@ impl HoldTracker {
         }
 
         record.state = HoldState::Cancelled;
+        true
+    }
+
+    /// Mark a held record as settled, returning whether it changed
+    pub fn mark_settled(&self, payment_hash: &[u8; 32]) -> bool {
+        let mut records = self.lock();
+        let Some(record) = records.get_mut(payment_hash) else {
+            return false;
+        };
+
+        if record.state != HoldState::Held {
+            return false;
+        }
+
+        record.state = HoldState::Settled;
         true
     }
 
@@ -518,6 +575,139 @@ mod tests {
             assert_eq!(record.state, terminal);
             assert_eq!(record.settle_deadline, Some(988));
         }
+    }
+
+    #[test]
+    fn settle_requires_a_held_record() {
+        let tracker = HoldTracker::new(12);
+
+        assert!(!tracker.mark_settled(&hash()));
+
+        tracker.observe(&hash(), HoldStatus::unpaid());
+        assert!(!tracker.mark_settled(&hash()));
+
+        tracker.observe(&hash(), status(HoldState::Held, Some(1_000)));
+        assert!(tracker.mark_settled(&hash()));
+    }
+
+    #[test]
+    fn settled_record_keeps_its_deadline_and_stops_cancelling() {
+        let tracker = HoldTracker::new(12);
+        tracker.observe(&hash(), status(HoldState::Held, Some(1_000)));
+
+        assert!(tracker.mark_settled(&hash()));
+        assert!(!tracker.mark_settled(&hash()));
+
+        let record = tracker.get(&hash()).expect("tracked record");
+        assert_eq!(record.state, HoldState::Settled);
+        assert_eq!(record.settle_deadline, Some(988));
+        assert!(tracker.held().is_empty());
+        assert_eq!(follow_action(record), FollowAction::Settle);
+    }
+
+    #[test]
+    fn settle_decision_accepts_at_the_deadline_height() {
+        let held = HoldRecord::from_status(status(HoldState::Held, Some(1_012)), 12);
+
+        assert_eq!(held.settle_deadline, Some(1_000));
+        assert_eq!(
+            settle_decision(held, false, Some(1_000)).ok(),
+            Some(SettleDecision::Settle)
+        );
+        assert_eq!(
+            settle_decision(held, false, Some(0)).ok(),
+            Some(SettleDecision::Settle)
+        );
+        assert!(matches!(
+            settle_decision(held, false, Some(1_001)),
+            Err(payment::Error::SettleDeadlinePassed)
+        ));
+    }
+
+    #[test]
+    fn persisted_preimage_is_accepted_past_the_deadline() {
+        let held = HoldRecord::from_status(status(HoldState::Held, Some(1_012)), 12);
+
+        assert_eq!(
+            settle_decision(held, true, Some(u32::MAX)).ok(),
+            Some(SettleDecision::Settle)
+        );
+        assert_eq!(
+            settle_decision(held, true, None).ok(),
+            Some(SettleDecision::Settle)
+        );
+    }
+
+    #[test]
+    fn settle_decision_accepts_a_held_record_without_deadline() {
+        let held = HoldRecord::from_status(status(HoldState::Held, None), 12);
+
+        assert_eq!(
+            settle_decision(held, false, Some(u32::MAX)).ok(),
+            Some(SettleDecision::Settle)
+        );
+    }
+
+    #[test]
+    fn settle_decision_needs_a_height_for_a_held_deadline() {
+        let held = HoldRecord::from_status(status(HoldState::Held, Some(1_012)), 12);
+
+        assert!(matches!(
+            settle_decision(held, false, None),
+            Err(payment::Error::UnknownPaymentState)
+        ));
+    }
+
+    #[test]
+    fn settle_decision_rejects_unpaid_and_cancelled_records() {
+        for (state, expected) in [
+            (HoldState::Unpaid, "not held"),
+            (HoldState::Cancelled, "cancelled"),
+        ] {
+            let record = HoldRecord::from_status(status(state, Some(1_000)), 12);
+            let error = settle_decision(record, false, Some(0)).expect_err(expected);
+
+            assert_eq!(
+                matches!(error, payment::Error::HoldNotHeld),
+                state == HoldState::Unpaid,
+                "{state:?}"
+            );
+            assert_eq!(
+                matches!(error, payment::Error::HoldCancelled),
+                state == HoldState::Cancelled,
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_record_is_not_settled_by_a_persisted_preimage() {
+        let cancelled = HoldRecord::from_status(status(HoldState::Cancelled, Some(1_000)), 12);
+
+        assert!(matches!(
+            settle_decision(cancelled, true, Some(0)),
+            Err(payment::Error::HoldCancelled)
+        ));
+    }
+
+    #[test]
+    fn settled_record_is_idempotent_past_the_deadline() {
+        let settled = HoldRecord::from_status(status(HoldState::Settled, Some(1_000)), 12);
+
+        assert_eq!(
+            settle_decision(settled, true, Some(u32::MAX)).ok(),
+            Some(SettleDecision::AlreadySettled)
+        );
+    }
+
+    #[test]
+    fn cancel_is_skipped_once_the_preimage_is_persisted() {
+        let held = HoldRecord::from_status(status(HoldState::Held, Some(1_000)), 12);
+
+        assert!(should_cancel(held, false, 989));
+        assert!(!should_cancel(held, true, 989));
+        assert!(!should_cancel(held, true, u32::MAX));
+        assert!(!should_cancel(held, false, 988));
     }
 
     #[test]

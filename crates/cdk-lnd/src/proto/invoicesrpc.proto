@@ -12,6 +12,8 @@ service Invoices {
     rpc CancelInvoice(CancelInvoiceMsg) returns (CancelInvoiceResp);
 
     rpc AddHoldInvoice(AddHoldInvoiceRequest) returns (AddHoldInvoiceResp);
+
+    rpc SettleInvoice(SettleInvoiceMsg) returns (SettleInvoiceResp);
 }
 
 message SubscribeSingleInvoiceRequest {
@@ -37,4 +39,11 @@ message AddHoldInvoiceRequest {
 
 message AddHoldInvoiceResp {
     string payment_request = 1;
+}
+
+message SettleInvoiceMsg {
+    bytes preimage = 1;
+}
+
+message SettleInvoiceResp {
 }

@@ -25,10 +25,23 @@ where LND gives up. Defaults are `settle_margin_blocks = 22` and
 `CDK_PAYMENT_PROCESSOR_LND_HOLD_SETTLE_MARGIN_BLOCKS` and
 `CDK_PAYMENT_PROCESSOR_LND_HOLD_EXPIRY_DELTA` to match a non-default LND.
 
-Hold state is kept in memory. On startup the backend pages through LND's pending
+Hold state is kept in memory, and the preimage of an accepted settle is persisted
+to a processor-owned SQLite file before `invoicesrpc.SettleInvoice` is called.
+`SettleInvoice` is retried in the background until LND reports the invoice as
+settled, the retry resumes on startup, and the deadline poller never cancels an
+invoice with a persisted preimage. Point the file with
+`CDK_PAYMENT_PROCESSOR_LND_HOLD_SETTLE_DB_PATH`; it defaults to
+`cdk-lnd-hold-settle.sqlite` in the working directory.
+
+On startup the backend pages through LND's pending
 invoices with `lnrpc.Lightning.ListInvoices` and resumes following them, so a
 held invoice is still cancelled after a restart even if the mint never checks
 that quote again.
+
+A settle request with a preimage that does not hash to the payment hash, a quote
+that is not held, a cancelled quote, or a height past `settle_deadline` is
+rejected so that the mint can answer with NUT-XX `20011` to `20014`. Repeating a
+settle of an already settled invoice returns the settled quote.
 
 The recovery lists every pending invoice of the node, and `lnrpc.Invoice` has no
 flag that marks a hold invoice, so this backend assumes a dedicated mint node.

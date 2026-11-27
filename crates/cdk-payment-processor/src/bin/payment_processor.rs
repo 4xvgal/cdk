@@ -107,6 +107,7 @@ pub const ENV_LND_HOLD_MAX_PENDING_QUOTES: &str =
     "CDK_PAYMENT_PROCESSOR_LND_HOLD_MAX_PENDING_QUOTES";
 pub const ENV_LND_HOLD_INVOICE_EXPIRY_SECS: &str =
     "CDK_PAYMENT_PROCESSOR_LND_HOLD_INVOICE_EXPIRY_SECS";
+pub const ENV_LND_HOLD_SETTLE_DB_PATH: &str = "CDK_PAYMENT_PROCESSOR_LND_HOLD_SETTLE_DB_PATH";
 
 #[derive(Parser)]
 #[command(name = "payment-processor")]
@@ -342,6 +343,9 @@ pub fn lnd_hold_settings_from_env() -> anyhow::Result<cdk_lnd_hold::Settings> {
         env_parsed(ENV_LND_HOLD_MAX_PENDING_QUOTES)?.unwrap_or(settings.max_pending_quotes);
     settings.invoice_expiry_secs =
         env_parsed(ENV_LND_HOLD_INVOICE_EXPIRY_SECS)?.unwrap_or(settings.invoice_expiry_secs);
+    settings.settle_db_path = env::var(ENV_LND_HOLD_SETTLE_DB_PATH)
+        .map(PathBuf::from)
+        .unwrap_or(settings.settle_db_path);
 
     Ok(settings)
 }
