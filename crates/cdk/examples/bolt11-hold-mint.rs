@@ -262,6 +262,17 @@ async fn mint(args: &[String]) -> CliResult<()> {
     Ok(())
 }
 
+async fn balance(args: &[String]) -> CliResult<()> {
+    let mint_url = argument(args, 1, "mint_url")?;
+    let store = localstore(&wallet_dir()).await?;
+    let wallet = open_wallet(&mint_url, store).await?;
+    let balances = wallet.total_balance().await?;
+    let amount = balances.to_u64();
+
+    println!("{}", json!({"mint_url": mint_url, "amount": amount}));
+    Ok(())
+}
+
 async fn dispatch(args: &[String]) -> CliResult<()> {
     match args.first().map(String::as_str) {
         Some("pubkey") => {
@@ -273,10 +284,11 @@ async fn dispatch(args: &[String]) -> CliResult<()> {
         Some("status") => status(args).await,
         Some("settle") => settle(args).await,
         Some("mint") => mint(args).await,
+        Some("balance") => balance(args).await,
         _ => Err(
             "usage: quote <mint_url> <payment_hash> <amount> [--cltv 432] \
                   [--lockup-script <hex>] | status <quote> | settle <quote> <preimage> | \
-                  mint <quote> | pubkey <secret_key_hex>"
+                  mint <quote> | balance <mint_url> | pubkey <secret_key_hex>"
                 .into(),
         ),
     }
